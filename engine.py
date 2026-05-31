@@ -953,3 +953,214 @@ def merge_json_files(file_contents: list, strategy: str = "auto") -> dict:
             stats["item_counts"].append({"file": f["name"], "keys": len(src)})
 
     return {"merged": merged, "merge_mode": merge_mode, "stats": stats}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SNI CORE EXTRACTOR  — output: sni_core.jsonl
+# ══════════════════════════════════════════════════════════════════════════════
+
+import urllib.request
+import urllib.error
+import base64
+
+_SNI_SYSTEM_PROMPT = """\
+Kamu adalah ekstraksi data SNI (Standar Nasional Indonesia) yang sangat presisi.
+Tugasmu: baca teks/gambar dokumen SNI dan kembalikan HANYA satu JSON object (tanpa markdown, tanpa penjelasan).
+
+Format wajib (semua field harus ada, string kosong jika tidak tersedia):
+{
+  "sni_id": "<nomor tanpa 'SNI', misal '01-3701-1995' atau '22739_2024'>",
+  "no_sni": "<nomor lengkap, misal 'SNI 01-3701-1995' atau 'SNI ISO 22739:2024'>",
+  "judul": "<judul bahasa Indonesia, tanpa tanda baca trailing>",
+  "tahun": <integer tahun, misal 2024>,
+  "kategori": "<ICS atau bidang, misal 'Pangan', 'Teknologi Informasi', 'Konstruksi'>",
+  "ruang_lingkup": "<ringkasan 1-2 kalimat max 150 karakter>",
+  "persyaratan": "<Parameter = Nilai Satuan harus/sebaiknya | Parameter2 = Nilai2 Satuan2 harus | ...> atau '-' jika tidak ada",
+  "metode_uji": "<Parameter = Kode/Nama metode kondisi | ...> atau '-' jika tidak ada",
+  "keywords": "<max 20 kata, wajib: parameter, angka, satuan, kode SNI; buang kata umum>",
+  "halaman": <integer jumlah halaman, 0 jika tidak diketahui>
+}
+
+Aturan ketat:
+- persyaratan: ambil SEMUA parameter yang punya angka + satuan + kata maks/min/harus/sebaiknya. Format "Parameter = Nilai Satuan harus/sebaiknya". Pisah " | ".
+- metode_uji: format "Parameter = Kode SNI Nama metode kondisi". Pisah " | ". Tulis '-' jika tidak ada metode uji eksplisit.
+- keywords: max 20 kata. Wajib ada angka, satuan, kode SNI terkait. Buang: batas mutu persyaratan standar nasional indonesia SNI.
+- ruang_lingkup: potong di 150 karakter, kalimat utuh.
+- Jangan tambah field lain. Jangan wrap dalam array. Output HANYA JSON object murni.
+"""
+
+_ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
+_SNI_MODEL = "claude-sonnet-4-20250514"
+
+
+def _call_claude_for_sni(text: str = "", image_b64: str = "", media_type: str = "image/png") -> dict:
+    """
+    Call Claude API to extract SNI fields.
+    Sends either text or image (base64) or both.
+    Returns parsed dict or raises on error.
+    """
+    content = []
+    if image_b64:
+        content.append({
+            "type": "image",
+            "source": {"type": "base64", "media_type": media_type, "data": image_b64},
+        })
+    if text.strip():
+        content.append({"type": "text", "text": f"Dokumen SNI:\n\n{text[:15000]}"})
+    if not content:
+        raise ValueError("No content to send to Claude API")
+
+    payload = json.dumps({
+        "model": _SNI_MODEL,
+        "max_tokens": 1000,
+        "system": _SNI_SYSTEM_PROMPT,
+        "messages": [{"role": "user", "content": content}],
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        _ANTHROPIC_API_URL,
+        data=payload,
+        headers={"Content-Type": "application/json", "anthropic-version": "2023-06-01"},
+        method="POST",
+    )
+
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+
+    raw = ""
+    for block in data.get("content", []):
+        if block.get("type") == "text":
+            raw += block["text"]
+
+    # Strip markdown code fences if Claude wrapped it anyway
+    raw = raw.strip()
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+
+    return json.loads(raw.strip())
+
+
+def _file_to_b64(path: Path) -> tuple[str, str]:
+    """Return (base64_data, media_type) for image files."""
+    ext = path.suffix.lower()
+    mt_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+              ".webp": "image/webp", ".gif": "image/gif"}
+    media_type = mt_map.get(ext, "image/png")
+    data = base64.b64encode(path.read_bytes()).decode("utf-8")
+    return data, media_type
+
+
+def extract_sni_from_file(file_info: dict) -> dict:
+    """
+    Extract SNI fields from a single file.
+    Returns the sni_core dict or a dict with '_error' key.
+    """
+    p = Path(file_info["path"])
+    ext = file_info["ext"].lower()
+
+    try:
+        if ext in IMAGE_EXTENSIONS:
+            b64, mt = _file_to_b64(p)
+            result = _call_claude_for_sni(image_b64=b64, media_type=mt)
+        elif ext == ".pdf":
+            # Try text extraction first; fall back to first-page image via pdf2image
+            text = extract_text_from_file(file_info["path"], ext)
+            if len(text.strip()) >= 100:
+                result = _call_claude_for_sni(text=text)
+            else:
+                # pdf2image fallback: send first page as image
+                try:
+                    from pdf2image import convert_from_path
+                    pages = convert_from_path(str(p), first_page=1, last_page=1, dpi=150)
+                    if pages:
+                        import io
+                        buf = io.BytesIO()
+                        pages[0].save(buf, format="PNG")
+                        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+                        result = _call_claude_for_sni(image_b64=b64, media_type="image/png")
+                    else:
+                        result = _call_claude_for_sni(text=text)
+                except ImportError:
+                    result = _call_claude_for_sni(text=text)
+        else:
+            text = extract_text_from_file(file_info["path"], ext)
+            result = _call_claude_for_sni(text=text)
+
+        # Normalise required keys
+        defaults = {
+            "sni_id": "", "no_sni": "", "judul": "", "tahun": 0,
+            "kategori": "", "ruang_lingkup": "", "persyaratan": "-",
+            "metode_uji": "-", "keywords": "", "halaman": 0,
+        }
+        for k, v in defaults.items():
+            if k not in result:
+                result[k] = v
+
+        result["_source_file"] = file_info["original_name"]
+        return result
+
+    except Exception as e:
+        return {
+            "_error": str(e),
+            "_source_file": file_info["original_name"],
+            "sni_id": "", "no_sni": "", "judul": "",
+            "tahun": 0, "kategori": "", "ruang_lingkup": "",
+            "persyaratan": "-", "metode_uji": "-",
+            "keywords": "", "halaman": 0,
+        }
+
+
+def process_sni_documents(
+    file_infos: list,
+    max_workers: int = 4,
+    progress_callback=None,
+) -> dict:
+    """
+    Process a list of SNI documents in parallel.
+    Returns dict with 'records' (list of sni_core dicts), 'stats'.
+    """
+    total = len(file_infos)
+    results = [None] * total
+    completed = [0]
+
+    def _task(args):
+        idx, info = args
+        return idx, extract_sni_from_file(info)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_task, (i, info)): i for i, info in enumerate(file_infos)}
+        for future in as_completed(futures):
+            idx, res = future.result()
+            results[idx] = res
+            completed[0] += 1
+            if progress_callback:
+                progress_callback(completed[0], total, res.get("_source_file", ""))
+
+    records = [r for r in results if r is not None]
+    ok = [r for r in records if "_error" not in r or not r.get("_error")]
+    err = [r for r in records if r.get("_error")]
+
+    return {
+        "records": records,
+        "stats": {
+            "total": total,
+            "success": len(ok),
+            "error": len(err),
+            "errors": [{"file": r["_source_file"], "error": r["_error"]} for r in err],
+        },
+    }
+
+
+def build_sni_jsonl(records: list) -> str:
+    """
+    Convert list of sni_core dicts to JSONL string.
+    Each line = 1 JSON object. No array, no trailing comma.
+    Strips internal '_source_file' key from output.
+    """
+    _CORE_KEYS = ["sni_id", "no_sni", "judul", "tahun", "kategori",
+                  "ruang_lingkup", "persyaratan", "metode_uji", "keywords", "halaman"]
+    lines = []
+    for rec in records:
+        obj = {k: rec.get(k, "" if k not in ("tahun", "halaman") else 0) for k in _CORE_KEYS}
+        lines.append(json.dumps(obj, ensure_ascii=False))
+    return "\n".join(lines)

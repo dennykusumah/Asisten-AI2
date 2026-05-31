@@ -964,29 +964,108 @@ import urllib.error
 import base64
 
 _SNI_SYSTEM_PROMPT = """\
-Kamu adalah ekstraksi data SNI (Standar Nasional Indonesia) yang sangat presisi.
-Tugasmu: baca teks/gambar dokumen SNI dan kembalikan HANYA satu JSON object (tanpa markdown, tanpa penjelasan).
+Kamu adalah ekstraktor data dokumen SNI (Standar Nasional Indonesia) yang sangat presisi.
+Baca dokumen SNI yang diberikan (bisa gambar cover, teks penuh, atau keduanya) lalu kembalikan \
+HANYA satu JSON object — tanpa markdown fence, tanpa komentar, tanpa teks tambahan.
 
-Format wajib (semua field harus ada, string kosong jika tidak tersedia):
+━━━ SCHEMA WAJIB (10 field, urutan tetap) ━━━
 {
-  "sni_id": "<nomor tanpa 'SNI', misal '01-3701-1995' atau '22739_2024'>",
-  "no_sni": "<nomor lengkap, misal 'SNI 01-3701-1995' atau 'SNI ISO 22739:2024'>",
-  "judul": "<judul bahasa Indonesia, tanpa tanda baca trailing>",
-  "tahun": <integer tahun, misal 2024>,
-  "kategori": "<ICS atau bidang, misal 'Pangan', 'Teknologi Informasi', 'Konstruksi'>",
-  "ruang_lingkup": "<ringkasan 1-2 kalimat max 150 karakter>",
-  "persyaratan": "<Parameter = Nilai Satuan harus/sebaiknya | Parameter2 = Nilai2 Satuan2 harus | ...> atau '-' jika tidak ada",
-  "metode_uji": "<Parameter = Kode/Nama metode kondisi | ...> atau '-' jika tidak ada",
-  "keywords": "<max 20 kata, wajib: parameter, angka, satuan, kode SNI; buang kata umum>",
-  "halaman": <integer jumlah halaman, 0 jika tidak diketahui>
+  "sni_id": "...",
+  "no_sni": "...",
+  "judul": "...",
+  "tahun": 0,
+  "kategori": "...",
+  "ruang_lingkup": "...",
+  "persyaratan": "...",
+  "metode_uji": "...",
+  "keywords": "...",
+  "halaman": 0
 }
 
-Aturan ketat:
-- persyaratan: ambil SEMUA parameter yang punya angka + satuan + kata maks/min/harus/sebaiknya. Format "Parameter = Nilai Satuan harus/sebaiknya". Pisah " | ".
-- metode_uji: format "Parameter = Kode SNI Nama metode kondisi". Pisah " | ". Tulis '-' jika tidak ada metode uji eksplisit.
-- keywords: max 20 kata. Wajib ada angka, satuan, kode SNI terkait. Buang: batas mutu persyaratan standar nasional indonesia SNI.
-- ruang_lingkup: potong di 150 karakter, kalimat utuh.
-- Jangan tambah field lain. Jangan wrap dalam array. Output HANYA JSON object murni.
+━━━ CARA MENGISI SETIAP FIELD ━━━
+
+sni_id  (string)
+  • Ambil dari baris header cover, contoh: "SNI ISO 22739:2024"
+  • Hapus kata "SNI" dan spasi di depan, ganti ":" dengan "_", ganti " " dengan "_"
+  • Contoh hasil: "ISO_22739_2024" atau "01-3701-1995"
+  • Jika format "SNI DD-NNNN:YYYY" → hasilkan "DD-NNNN_YYYY"
+
+no_sni  (string)
+  • Nomor SNI LENGKAP persis seperti tertulis di cover, termasuk kata "SNI"
+  • Contoh: "SNI ISO 22739:2024" atau "SNI 01-3701-1995"
+
+judul  (string)
+  • Judul BAHASA INDONESIA dari cover (bukan judul bahasa Inggris)
+  • Bersihkan tanda baca trailing (titik, koma, dll)
+  • Contoh: "Blockchain dan teknologi buku besar terdistribusi — Kosakata"
+
+tahun  (integer)
+  • Tahun penetapan SNI — ambil dari nomor SNI atau baris "(Ditetapkan oleh BSN tahun YYYY)"
+  • Jika ada dua angka tahun, pakai tahun di nomor SNI
+  • Harus integer, bukan string
+
+kategori  (string)
+  • Bidang/topik SNI berdasarkan kode ICS yang tertera di cover (pojok kiri bawah)
+  • Pemetaan kode ICS → kategori:
+      01.xxx  → Umum, Terminologi
+      11.xxx  → Kesehatan, Kedokteran
+      13.xxx  → Lingkungan, Keselamatan
+      23.xxx  → Fluid systems, Komponen
+      25.xxx  → Manufaktur, Teknik
+      35.xxx  → Teknologi Informasi, Telekomunikasi
+      43.xxx  → Kendaraan Bermotor
+      55.xxx  → Kemasan, Distribusi Barang
+      65.xxx  → Pertanian, Pangan
+      67.xxx  → Teknologi Pangan, Minuman
+      71.xxx  → Kimia, Industri Kimia
+      73.xxx  → Pertambangan, Mineral
+      77.xxx  → Metalurgi
+      91.xxx  → Konstruksi, Material Bangunan
+      93.xxx  → Teknik Sipil
+  • Jika kode ICS tidak ada di daftar: gunakan deskripsi singkat bidang dari judul
+
+ruang_lingkup  (string)
+  • Ringkasan SINGKAT isi/cakupan standar, 1–2 kalimat, MAKSIMAL 150 karakter
+  • Jika dokumen hanya cover/halaman depan: tulis ruang lingkup berdasarkan judul
+  • Jangan melebihi 150 karakter — potong di batas kalimat
+
+persyaratan  (string)
+  • Jika dokumen mengandung tabel syarat mutu: ekstrak SEMUA baris yang punya angka + satuan
+  • Format tiap item: "NamaParameter = NilaiAngka Satuan harus/maks/min/sebaiknya"
+  • Pisahkan item dengan " | "
+  • Contoh: "E.coli = 0 /100ml harus | Arsen = maks 0,05 mg/L harus | pH = 6,5–8,5 harus"
+  • Jika dokumen adalah kosakata/terminologi/vocabulary TANPA tabel syarat: isi "-"
+  • Jika dokumen hanya cover: isi "-"
+
+metode_uji  (string)
+  • Jika ada referensi metode pengujian eksplisit: format "Parameter = KodeSNI NamaMetode kondisi"
+  • Pisahkan item dengan " | "
+  • Jika tidak ada: isi "-"
+
+keywords  (string)
+  • MAKSIMAL 20 kata, dipisah spasi
+  • Wajib sertakan: nomor SNI (tanpa "SNI"), tahun, kata kunci teknis dari judul
+  • Untuk dokumen kosakata: sertakan istilah-istilah kunci
+  • Buang kata-kata umum: standar nasional indonesia SNI badan persyaratan mutu
+
+halaman  (integer)
+  • Jumlah halaman dokumen jika diketahui, atau 0 jika tidak ada informasi halaman
+
+━━━ CONTOH OUTPUT untuk "SNI ISO 22739:2024" ━━━
+{
+  "sni_id": "ISO_22739_2024",
+  "no_sni": "SNI ISO 22739:2024",
+  "judul": "Blockchain dan teknologi buku besar terdistribusi — Kosakata",
+  "tahun": 2024,
+  "kategori": "Teknologi Informasi, Telekomunikasi",
+  "ruang_lingkup": "Standar kosakata untuk blockchain dan teknologi buku besar terdistribusi, adopsi identik ISO 22739:2024.",
+  "persyaratan": "-",
+  "metode_uji": "-",
+  "keywords": "ISO_22739_2024 blockchain distributed ledger kosakata vocabulary 35.030 IDT 2024",
+  "halaman": 0
+}
+
+OUTPUT: JSON object murni saja. Tidak boleh ada teks lain di luar JSON.
 """
 
 _ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
@@ -996,7 +1075,7 @@ _SNI_MODEL = "claude-sonnet-4-20250514"
 def _call_claude_for_sni(text: str = "", image_b64: str = "", media_type: str = "image/png") -> dict:
     """
     Call Claude API to extract SNI fields.
-    Sends either text or image (base64) or both.
+    Sends image (base64) and/or text content.
     Returns parsed dict or raises on error.
     """
     content = []
@@ -1006,13 +1085,20 @@ def _call_claude_for_sni(text: str = "", image_b64: str = "", media_type: str = 
             "source": {"type": "base64", "media_type": media_type, "data": image_b64},
         })
     if text.strip():
-        content.append({"type": "text", "text": f"Dokumen SNI:\n\n{text[:15000]}"})
+        # Send first 20 000 chars — covers most SNI documents fully
+        content.append({
+            "type": "text",
+            "text": (
+                "Berikut isi dokumen SNI. Ekstrak semua field sesuai instruksi sistem.\n\n"
+                f"{text[:20000]}"
+            ),
+        })
     if not content:
         raise ValueError("No content to send to Claude API")
 
     payload = json.dumps({
         "model": _SNI_MODEL,
-        "max_tokens": 1000,
+        "max_tokens": 1500,
         "system": _SNI_SYSTEM_PROMPT,
         "messages": [{"role": "user", "content": content}],
     }).encode("utf-8")
@@ -1024,7 +1110,7 @@ def _call_claude_for_sni(text: str = "", image_b64: str = "", media_type: str = 
         method="POST",
     )
 
-    with urllib.request.urlopen(req, timeout=60) as resp:
+    with urllib.request.urlopen(req, timeout=90) as resp:
         data = json.loads(resp.read().decode("utf-8"))
 
     raw = ""
@@ -1032,12 +1118,20 @@ def _call_claude_for_sni(text: str = "", image_b64: str = "", media_type: str = 
         if block.get("type") == "text":
             raw += block["text"]
 
-    # Strip markdown code fences if Claude wrapped it anyway
     raw = raw.strip()
-    raw = re.sub(r"^```(?:json)?\s*", "", raw)
-    raw = re.sub(r"\s*```$", "", raw)
 
-    return json.loads(raw.strip())
+    # Strip markdown code fences (```json ... ``` or ``` ... ```)
+    raw = re.sub(r"^```(?:json)?\s*\n?", "", raw)
+    raw = re.sub(r"\n?\s*```\s*$", "", raw)
+    raw = raw.strip()
+
+    # If Claude prepended explanation text, find the first '{' and last '}'
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        raw = raw[start : end + 1]
+
+    return json.loads(raw)
 
 
 def _file_to_b64(path: Path) -> tuple[str, str]:
@@ -1053,40 +1147,55 @@ def _file_to_b64(path: Path) -> tuple[str, str]:
 def extract_sni_from_file(file_info: dict) -> dict:
     """
     Extract SNI fields from a single file.
-    Returns the sni_core dict or a dict with '_error' key.
+    Strategy:
+      - Image files → send as image directly to Claude (cover page visual)
+      - PDF        → send full text; if text thin (<100 chars), also send p.1 as image
+      - DOCX/TXT  → send extracted text
+    Returns the sni_core dict, always includes '_source_file'.
+    On error, includes '_error' key.
     """
     p = Path(file_info["path"])
     ext = file_info["ext"].lower()
 
     try:
         if ext in IMAGE_EXTENSIONS:
+            # Cover-page image → best visual context
             b64, mt = _file_to_b64(p)
             result = _call_claude_for_sni(image_b64=b64, media_type=mt)
+
         elif ext == ".pdf":
-            # Try text extraction first; fall back to first-page image via pdf2image
             text = extract_text_from_file(file_info["path"], ext)
-            if len(text.strip()) >= 100:
-                result = _call_claude_for_sni(text=text)
+            text_ok = len(text.strip()) >= 100
+
+            # Always try to get page-1 image for visual cover context
+            cover_b64 = ""
+            try:
+                from pdf2image import convert_from_path
+                import io as _io
+                pages = convert_from_path(str(p), first_page=1, last_page=1, dpi=150)
+                if pages:
+                    buf = _io.BytesIO()
+                    pages[0].save(buf, format="PNG")
+                    cover_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+            except Exception:
+                pass  # pdf2image not installed or failed — fall through
+
+            if cover_b64 and text_ok:
+                # Best case: visual cover + full text
+                result = _call_claude_for_sni(
+                    text=text, image_b64=cover_b64, media_type="image/png"
+                )
+            elif cover_b64:
+                result = _call_claude_for_sni(image_b64=cover_b64, media_type="image/png")
             else:
-                # pdf2image fallback: send first page as image
-                try:
-                    from pdf2image import convert_from_path
-                    pages = convert_from_path(str(p), first_page=1, last_page=1, dpi=150)
-                    if pages:
-                        import io
-                        buf = io.BytesIO()
-                        pages[0].save(buf, format="PNG")
-                        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-                        result = _call_claude_for_sni(image_b64=b64, media_type="image/png")
-                    else:
-                        result = _call_claude_for_sni(text=text)
-                except ImportError:
-                    result = _call_claude_for_sni(text=text)
+                result = _call_claude_for_sni(text=text)
+
         else:
+            # DOCX, TXT, MD, etc.
             text = extract_text_from_file(file_info["path"], ext)
             result = _call_claude_for_sni(text=text)
 
-        # Normalise required keys
+        # Normalise — fill in any missing keys with safe defaults
         defaults = {
             "sni_id": "", "no_sni": "", "judul": "", "tahun": 0,
             "kategori": "", "ruang_lingkup": "", "persyaratan": "-",
@@ -1095,6 +1204,13 @@ def extract_sni_from_file(file_info: dict) -> dict:
         for k, v in defaults.items():
             if k not in result:
                 result[k] = v
+
+        # Coerce numeric fields
+        for int_key in ("tahun", "halaman"):
+            try:
+                result[int_key] = int(result[int_key])
+            except (TypeError, ValueError):
+                result[int_key] = 0
 
         result["_source_file"] = file_info["original_name"]
         return result

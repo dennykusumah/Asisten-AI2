@@ -35,47 +35,47 @@ MAX_SCOPE_CHARS = 600   # Ruang lingkup full, bukan potong 150
 
 # ICS code → kategori (prioritas pertama, paling akurat)
 ICS_KATEGORI: dict[str, str] = {
-    "67": "Pangan",
-    "71": "Kimia",
-    "91": "Konstruksi",
-    "29": "Elektro",
-    "27": "Elektro",
-    "23": "Mekanik",
-    "25": "Mekanik",
-    "59": "Tekstil",
-    "65": "Pertanian",
-    "13": "Lingkungan",
-    "11": "Kesehatan",
-    "35": "Informatika",
-    "43": "Transportasi",
-    "45": "Transportasi",
-    "03": "Manajemen",
-    "01": "Umum",
-    "07": "Sains",
-    "17": "Metrologi",
-    "19": "Pengujian",
-    "21": "Sistem Mekanik",
-    "31": "Elektronik",
-    "33": "Telekomunikasi",
-    "37": "Optik",
-    "39": "Presisi",
-    "41": "Tekstil",
-    "47": "Perkapalan",
-    "49": "Penerbangan",
-    "53": "Material Handling",
-    "55": "Kemasan",
-    "57": "Kertas",
-    "61": "Industri Tekstil",
-    "75": "Minyak Bumi",
-    "77": "Metalurgi",
-    "79": "Kayu",
-    "81": "Keramik",
-    "83": "Karet",
-    "85": "Kertas Cetak",
-    "87": "Cat & Pelapis",
-    "93": "Sipil",
-    "95": "Pertahanan",
-    "97": "Rumah Tangga",
+    "67": "pangan",
+    "71": "kimia",
+    "91": "konstruksi",
+    "29": "elektro",
+    "27": "elektro",
+    "23": "mekanik",
+    "25": "mekanik",
+    "59": "tekstil",
+    "65": "pertanian",
+    "13": "lingkungan",
+    "11": "kesehatan",
+    "35": "teknologi informasi",
+    "43": "transportasi",
+    "45": "transportasi",
+    "03": "manajemen",
+    "01": "umum",
+    "07": "sains",
+    "17": "metrologi",
+    "19": "pengujian",
+    "21": "sistem mekanik",
+    "31": "elektronik",
+    "33": "telekomunikasi",
+    "37": "optik",
+    "39": "presisi",
+    "41": "tekstil",
+    "47": "perkapalan",
+    "49": "penerbangan",
+    "53": "material handling",
+    "55": "kemasan",
+    "57": "kertas",
+    "61": "industri tekstil",
+    "75": "minyak bumi",
+    "77": "metalurgi",
+    "79": "kayu",
+    "81": "keramik",
+    "83": "karet",
+    "85": "kertas cetak",
+    "87": "cat dan pelapis",
+    "93": "sipil",
+    "95": "pertahanan",
+    "97": "rumah tangga",
 }
 
 # Keyword matching sebagai fallback
@@ -83,35 +83,35 @@ CATEGORY_RULES: list[tuple[list[str], str]] = [
     (["pangan", "makanan", "minuman", "gula", "garam", "minyak", "susu",
       "daging", "ikan", "beras", "tepung", "kopi", "teh", "cokelat", "bumbu",
       "saos", "kecap", "mie", "roti", "biskuit", "snack", "keju", "mentega",
-      "margarin", "es krim", "sirup", "jus", "sari buah", "halal", "pakan"], "Pangan"),
+      "margarin", "es krim", "sirup", "jus", "sari buah", "halal", "pakan"], "pangan"),
     (["kimia", "bahan kimia", "pestisida", "pupuk", "cat", "pelarut", "asam",
       "basa", "reagen", "deterjen", "sabun", "kosmetik", "parfum", "pigmen",
-      "adhesif", "lem", "polimer", "plastik", "resin"], "Kimia"),
+      "adhesif", "lem", "polimer", "plastik", "resin"], "kimia"),
     (["konstruksi", "bangunan", "beton", "semen", "baja", "besi", "kayu",
       "cat tembok", "keramik", "genteng", "bata", "pondasi", "aspal",
-      "agregat", "mortar", "panel", "plat", "pipa konstruksi", "struktur"], "Konstruksi"),
+      "agregat", "mortar", "panel", "plat", "pipa konstruksi", "struktur"], "konstruksi"),
     (["elektro", "listrik", "elektronik", "kabel", "transformator", "motor",
       "generator", "baterai", "saklar", "stop kontak", "lampu", "led",
-      "solar", "panel surya", "inverter", "ups", "charger", "tegangan"], "Elektro"),
+      "solar", "panel surya", "inverter", "ups", "charger", "tegangan"], "elektro"),
     (["mekanik", "mesin", "pompa", "kompresor", "turbin", "roda gigi",
       "bearing", "piston", "silinder", "katup", "flanges", "baut", "mur",
-      "valve", "pressure"], "Mekanik"),
+      "valve", "pressure"], "mekanik"),
     (["tekstil", "kain", "benang", "serat", "rajut", "tenun", "pakaian",
-      "garmen", "karpet", "nonwoven"], "Tekstil"),
+      "garmen", "karpet", "nonwoven"], "tekstil"),
     (["pertanian", "agro", "bibit", "benih", "tanah", "irigasi", "traktor",
-      "hortikultura", "perkebunan", "kehutanan", "perikanan"], "Pertanian"),
+      "hortikultura", "perkebunan", "kehutanan", "perikanan"], "pertanian"),
     (["lingkungan", "air bersih", "air minum", "air limbah", "udara", "emisi",
-      "polutan", "baku mutu lingkungan", "amdal", "limbah", "pencemaran"], "Lingkungan"),
+      "polutan", "baku mutu lingkungan", "amdal", "limbah", "pencemaran"], "lingkungan"),
     (["kesehatan", "medis", "alat kesehatan", "farmasi", "obat", "sterilisasi",
       "masker", "sarung tangan medis", "jarum", "syringe", "laboratorium klinik",
-      "diagnostik"], "Kesehatan"),
+      "diagnostik"], "kesehatan"),
     (["informatika", "teknologi informasi", "perangkat lunak", "software",
       "hardware", "jaringan", "keamanan informasi", "keamanan siber",
-      "enkripsi", "iso 27", "isms", "iec 27", "manajemen keamanan"], "Informatika"),
+      "enkripsi", "iso 27", "isms", "iec 27", "manajemen keamanan"], "teknologi informasi"),
     (["transportasi", "kendaraan", "otomotif", "sepeda motor", "ban", "helm",
-      "sabuk pengaman", "kapal", "pesawat", "kereta", "automotive"], "Transportasi"),
+      "sabuk pengaman", "kapal", "pesawat", "kereta", "automotive"], "transportasi"),
     (["manajemen", "sistem manajemen", "audit", "sertifikasi", "akreditasi",
-      "mutu", "kualitas", "iso 9", "iso 14", "iso 45", "ohsas"], "Manajemen"),
+      "mutu", "kualitas", "iso 9", "iso 14", "iso 45", "ohsas"], "manajemen"),
 ]
 
 # Pattern SNI number
@@ -456,7 +456,7 @@ def parse_kategori(cover: str, full: str) -> str:
             if kw in text_low:
                 return cat
 
-    return "Umum"
+    return "umum"
 
 
 # ─── Utility: find section ────────────────────────────────────────────────────
@@ -673,88 +673,95 @@ def parse_metode_uji(full: str) -> str:
 def parse_keywords(judul: str, kategori: str, ruang_lingkup: str,
                    no_sni: str) -> str:
     """
-    Bangun string keywords dari:
-    1. Kata kunci bermakna dari judul
-    2. Kategori
-    3. Topik utama dari ruang lingkup (noun phrases pendek)
-    4. Nomor standar (tanpa prefix "SNI")
+    Bangun string keywords yang ringkas dan akurat dari judul dokumen SNI.
     
-    Format: "kata1, kata2, kata3"
+    Strategi: ambil frasa inti dari tiap segmen judul (setelah " - "),
+    hilangkan kata generik di awal, ambil yang paling spesifik.
+    
+    Format target: "audit, sistem manajemen keamanan informasi"
     """
-    kws: list[str] = []
-    seen: set[str] = set()
-
-    def add_kw(w: str) -> None:
-        w = w.strip().lower()
-        if w and w not in seen and len(w) > 2:
-            seen.add(w)
-            kws.append(w)
-
-    # Stopwords (extended)
-    STOP = {
+    GENERIC_PREFIX = re.compile(
+        r'^(?:pedoman|panduan|teknik|teknologi|cara|metode|spesifikasi|'
+        r'persyaratan|prinsip|sistem|pengantar|petunjuk|petunjuk teknis|'
+        r'informasi tentang|guidelines for|guidance on|requirements for|'
+        r'code of practice for)\s+',
+        re.IGNORECASE
+    )
+    STOP_WORDS = {
         "standar", "nasional", "indonesia", "dan", "atau", "untuk", "dari",
         "dengan", "yang", "dalam", "sni", "iso", "iec", "bsn", "ini",
         "adalah", "pada", "juga", "oleh", "ke", "di", "the", "of", "and",
         "or", "for", "in", "a", "an", "to", "with", "its", "this",
-        "document", "guidance", "guidelines", "general", "technical",
-        "part", "section", "annex", "note", "ditetapkan", "tahun",
-        "bagian", "pedoman", "teknik", "teknis", "panduan", "prinsip",
-        "umum", "edisi", "revisi", "adopsi", "identik",
+        "document", "guidance", "general", "technical", "part",
+        "ditetapkan", "tahun", "bagian", "edisi", "revisi", "adopsi",
     }
 
-    # 1. Kata dari judul (pertahankan multi-kata bermakna)
-    judul_clean = re.sub(r'\s*[-–—]\s*', ' - ', judul)
-    # Split berdasarkan " - " untuk mendapatkan bagian-bagian judul
-    judul_parts = re.split(r'\s+-\s+', judul_clean)
-    for part in judul_parts:
+    kws: list[str] = []
+    seen: set[str] = set()
+
+    def add(w: str) -> None:
+        w = re.sub(r'\s+', ' ', w.strip().lower())
+        if w and w not in seen and len(w) > 2 and w not in STOP_WORDS:
+            seen.add(w)
+            kws.append(w)
+
+    # Pecah judul per " - "
+    parts = re.split(r'\s*[-–—]\s*', judul)
+
+    for part in parts:
         part = part.strip()
-        if len(part) > 3 and part.lower() not in STOP:
-            # Tambahkan sebagai frasa jika > 1 kata
-            words = part.split()
-            if len(words) > 1:
-                add_kw(part.lower())
-            # Tambahkan kata individual yang bermakna
-            for w in words:
-                w_clean = re.sub(r'[^\w]', '', w)
-                if len(w_clean) > 3 and w_clean.lower() not in STOP:
-                    add_kw(w_clean.lower())
+        if len(part) < 4:
+            continue
+        # Hapus prefix generik untuk dapatkan inti
+        core = GENERIC_PREFIX.sub('', part).strip()
+        if core and core.lower() not in STOP_WORDS and len(core) > 3:
+            add(core)
 
-    # 2. Kategori
-    if kategori and kategori.lower() not in STOP:
-        add_kw(kategori.lower())
+    # Jika keywords terlalu banyak, pertahankan hanya yang paling spesifik:
+    # yaitu yang TIDAK generik (tidak diawali kata seperti "teknologi", "teknik", dll)
+    GENERIC_STANDALONE = re.compile(
+        r'^(teknologi informasi|teknik keamanan|teknik|teknologi|informasi|'
+        r'keamanan|manajemen|sistem)$',
+        re.IGNORECASE
+    )
+    # Filter: buang yang terlalu generik jika sudah ada yang lebih spesifik
+    specific = [k for k in kws if not GENERIC_STANDALONE.match(k)]
+    generic  = [k for k in kws if GENERIC_STANDALONE.match(k)]
 
-    # 3. Topik utama dari ruang lingkup (noun phrases pendek, maks 3 kata)
-    if ruang_lingkup:
-        # Cari noun phrases: kata besar di awal kalimat atau setelah "mengenai"/"tentang"
-        scope_phrases = re.findall(
-            r'\b(?:mengenai|tentang|provides guidance on|applicable to)\s+'
-            r'([a-zA-Z][a-zA-Z\s]{3,40}?)(?:[,;.]|$)',
-            ruang_lingkup, re.IGNORECASE
-        )
-        for phrase in scope_phrases[:3]:
-            phrase = phrase.strip()
-            if 4 < len(phrase) < 60:
-                add_kw(phrase.lower())
+    # Dari frasa panjang yang spesifik, juga ekstrak kata kunci pertama
+    # Mis: "audit sistem manajemen keamanan informasi" → tambahkan "audit" saja
+    extra: list[str] = []
+    for phrase in specific:
+        first_word = phrase.split()[0]
+        if (first_word not in seen and len(first_word) > 3
+                and not GENERIC_STANDALONE.match(first_word)):
+            extra.append(first_word)
 
-    # 4. Nomor standar (bagian numerik dari no_sni)
-    if no_sni:
-        # Ambil bagian setelah "SNI "
-        sni_num = re.sub(r'^SNI\s+', '', no_sni, flags=re.IGNORECASE).strip()
-        if sni_num:
-            add_kw(sni_num.lower())
-
-    # Hasil final: maksimal 8 keyword, dipisah koma
-    # Prioritaskan frasa multi-kata (lebih deskriptif)
-    result_kws = []
-    for k in kws:
-        if ' ' in k:  # Frasa multi-kata dulu
-            result_kws.insert(0, k) if len(result_kws) < 4 else result_kws.append(k)
+    # Susun: kata tunggal dulu (lebih ringkas), lalu frasa spesifik
+    # Hapus frasa yang hanya menambahkan kata di depan frasa lain (duplikat)
+    ordered: list[str] = []
+    for w in extra:
+        if w not in ordered:
+            ordered.append(w)
+    for k in specific:
+        # Jangan tambahkan frasa yang diawali kata yang sudah ada di ordered
+        first = k.split()[0]
+        if first in ordered:
+            # Simpan sisa frasa setelah kata pertama sebagai keyword baru
+            rest = " ".join(k.split()[1:]).strip()
+            if rest and rest not in ordered and len(rest) > 4:
+                ordered.append(rest)
         else:
-            result_kws.append(k)
-        if len(result_kws) >= 8:
-            break
+            if k not in ordered:
+                ordered.append(k)
 
-    return ", ".join(result_kws[:8])
+    # Prioritaskan yang spesifik, maksimal 3 keywords
+    final = ordered[:3]
+    # Tambah generic hanya jika kurang dari 2 keyword
+    if len(final) < 2:
+        final += [g for g in generic if g not in final][:2 - len(final)]
+
+    return ", ".join(final)
 
 
 # ─── Main extraction entry point ──────────────────────────────────────────────

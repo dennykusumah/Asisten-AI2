@@ -1,1412 +1,316 @@
-# engine.py
 """
-DocAI Trainer - Engine
-Core processing logic: file extraction, chunking, merging, session management.
-Improvements:
-  - Support PDF, DOC, DOCX, JPG, PNG, JPEG, WEBP, GIF images (OCR)
-  - Up to 200 files, 200 MB per file
-  - Parallel processing with ThreadPoolExecutor
-  - Auto-paraphrase on process click (without API)
-  - Default paraphrase language = auto-detect
+engine.py — Core processing engine for SNI document extraction
+Handles PDF/Word parsing + Gemini API extraction + JSONL output
 """
 
 import os
-import json
-import uuid
-import shutil
-import time
 import re
-import random
-import urllib.request
-import urllib.error
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+import json
+import time
+import logging
+import hashlib
 from pathlib import Path
-from typing import Optional
+from typing import Generator, Optional
+from dataclasses import dataclass, asdict
 
-# ──────────────────────────────────────────────────────────────────────────────
-# CONSTANTS
-# ──────────────────────────────────────────────────────────────────────────────
+import google.generativeai as genai
+from pypdf import PdfReader
+from docx import Document as DocxDocument
 
-UPLOADS_DIR = Path("uploads")
-UPLOADS_DIR.mkdir(exist_ok=True)
+# ── Logging ──────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("sni_engine")
 
-ALLOWED_EXTENSIONS = {".pdf", ".doc", ".docx", ".txt", ".md", ".jpg", ".jpeg", ".png", ".webp", ".gif"}
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
-MAX_FILE_SIZE_MB = 200
-MAX_FILES = 200
+# ── Constants ─────────────────────────────────────────────────────────────────
+MAX_TEXT_CHARS = 12_000      # chars sent to Gemini per file (keep costs low)
+MAX_SCOPE_CHARS = 150
+MAX_KW_WORDS = 20
+GEMINI_MODEL = "gemini-1.5-flash"
+RETRY_LIMIT = 3
+RETRY_DELAY = 5              # seconds between retries
 
-# Indonesian synonyms for paraphrasing
-INDONESIAN_SYNONYMS = {
-    "menggunakan": ["memakai", "mengaplikasikan", "menerapkan"],
-    "membuat": ["menyusun", "merancang", "menghasilkan"],
-    "mendapatkan": ["memperoleh", "meraih", "menerima"],
-    "melakukan": ["menjalankan", "mengerjakan", "mengaplikasikan"],
-    "mempunyai": ["memiliki", "memperoleh", "mengandung"],
-    "menunjukkan": ["menampilkan", "memperlihatkan", "mengindikasikan"],
-    "menghasilkan": ["memproduksi", "menciptakan", "menyediakan"],
-    "mengurangi": ["meminimalkan", "menurunkan", "memperkecil"],
-    "meningkatkan": ["menambah", "memperbesar", "mengembangkan"],
-    "mengembangkan": ["memajukan", "memperluas", "meningkatkan"],
-    "penting": ["signifikan", "krusial", "esensial"],
-    "baik": ["bagus", "berkualitas", "memadai"],
-    "besar": ["luas", "signifikan", "substansial"],
-    "kecil": ["minimal", "sedikit", "terbatas"],
-    "cepat": ["sigap", "efisien", "responsif"],
-    "mudah": ["sederhana", "praktis", "tidak rumit"],
-    "sulit": ["kompleks", "menantang", "rumit"],
-    "juga": ["pun", "lagipula", "selain itu"],
-    "karena": ["sebab", "akibat", "lantaran"],
-    "tetapi": ["namun", "akan tetapi", "meskipun demikian"],
-    "dengan": ["melalui", "lewat", "menggunakan"],
-    "untuk": ["bagi", "kepada", "demi"],
-    "dari": ["asal", "berasal", "pangkal"],
-    "dalam": ["di", "pada", "ke dalam"],
-    "atau": ["maupun", "ataupun", "bahkan"],
-    "dan": ["serta", "dan juga", "lagi pula"],
+CATEGORY_MAP = {
+    "pangan": "Pangan", "makanan": "Pangan", "minuman": "Pangan",
+    "kimia": "Kimia", "bahan kimia": "Kimia",
+    "konstruksi": "Konstruksi", "bangunan": "Konstruksi", "beton": "Konstruksi", "semen": "Konstruksi",
+    "elektro": "Elektro", "listrik": "Elektro", "elektronik": "Elektro",
+    "mekanik": "Mekanik", "mesin": "Mekanik",
+    "tekstil": "Tekstil", "kain": "Tekstil", "benang": "Tekstil",
+    "pertanian": "Pertanian", "agro": "Pertanian",
+    "lingkungan": "Lingkungan", "air": "Lingkungan",
+    "kesehatan": "Kesehatan", "medis": "Kesehatan",
+    "informatika": "Informatika", "teknologi informasi": "Informatika",
+    "transportasi": "Transportasi", "kendaraan": "Transportasi",
 }
 
-ENGLISH_SYNONYMS = {
-    "use": ["utilize", "employ", "apply"],
-    "make": ["create", "construct", "build"],
-    "get": ["obtain", "acquire", "receive"],
-    "do": ["perform", "execute", "conduct"],
-    "have": ["possess", "contain", "hold"],
-    "show": ["display", "demonstrate", "indicate"],
-    "produce": ["generate", "create", "yield"],
-    "reduce": ["minimize", "decrease", "lessen"],
-    "increase": ["enhance", "boost", "improve"],
-    "develop": ["advance", "expand", "grow"],
-    "important": ["significant", "crucial", "essential"],
-    "good": ["excellent", "quality", "adequate"],
-    "big": ["large", "substantial", "significant"],
-    "small": ["minimal", "limited", "minor"],
-    "fast": ["quick", "rapid", "efficient"],
-    "easy": ["simple", "straightforward", "uncomplicated"],
-    "difficult": ["complex", "challenging", "hard"],
-    "also": ["additionally", "furthermore", "moreover"],
-    "because": ["since", "as", "due to"],
-    "but": ["however", "nevertheless", "yet"],
-    "with": ["using", "through", "by means of"],
-    "for": ["to", "in order to", "intended for"],
-    "from": ["originating", "derived", "starting"],
-    "in": ["within", "inside", "during"],
-    "or": ["alternatively", "otherwise", "or else"],
-    "and": ["as well as", "along with", "plus"],
+GEMINI_PROMPT = """Kamu adalah ekstraksi SNI (Standar Nasional Indonesia) yang sangat presisi.
+Baca dokumen SNI di bawah ini dan ekstrak informasi PERSIS sesuai format JSON berikut.
+Aturan KETAT:
+1. persyaratan: "Parameter = Nilai Satuan harus/sebaiknya". Pisah dengan " | ". Ambil SEMUA angka+satuan. Jika kosong: "-"
+2. metode_uji: "Parameter = Kode_SNI Nama_metode kondisi_singkat". Pisah " | ". Jika kosong: "-"
+3. keywords: Maks 20 kata. Wajib ada: nama parameter, angka kunci, satuan, kode SNI lain. Pisah spasi.
+4. ruang_lingkup: 1-2 kalimat, maks 150 karakter.
+5. kategori: Satu kata saja dari: Pangan, Kimia, Konstruksi, Elektro, Mekanik, Tekstil, Pertanian, Lingkungan, Kesehatan, Informatika, Transportasi, Lainnya
+
+Kembalikan HANYA JSON valid, tanpa markdown, tanpa komentar, tanpa teks lain.
+
+Format output:
+{
+  "sni_id": "<nomor SNI tanpa prefix 'SNI', contoh: 01-3701-1995>",
+  "no_sni": "<prefix SNI + nomor, contoh: SNI 01-3701-1995>",
+  "judul": "<judul resmi SNI>",
+  "kategori": "<satu kata kategori>",
+  "ruang_lingkup": "<1-2 kalimat maks 150 char>",
+  "persyaratan": "<param=nilai satuan harus | param2=nilai2 satuan2 sebaiknya | ...>",
+  "metode_uji": "<param=kode_sni nama_metode kondisi | ...>",
+  "keywords": "<kata1 kata2 ... maks20>"
 }
 
-# ──────────────────────────────────────────────────────────────────────────────
-# UTILITY
-# ──────────────────────────────────────────────────────────────────────────────
-
-def format_size(byte_count: int) -> str:
-    if byte_count == 0:
-        return "0 B"
-    units = ["B", "KB", "MB", "GB"]
-    i = 0
-    val = float(byte_count)
-    while val >= 1024 and i < len(units) - 1:
-        val /= 1024
-        i += 1
-    return f"{val:.2f} {units[i]}"
+Dokumen SNI:
+{text}
+"""
 
 
-def generate_session_id() -> str:
-    return f"sess_{int(time.time() * 1000)}_{uuid.uuid4().hex[:9]}"
+# ── Data model ────────────────────────────────────────────────────────────────
+@dataclass
+class SNIRecord:
+    sni_id: str = ""
+    no_sni: str = ""
+    judul: str = ""
+    kategori: str = ""
+    ruang_lingkup: str = ""
+    persyaratan: str = "-"
+    metode_uji: str = "-"
+    keywords: str = ""
+
+    def to_jsonl_line(self) -> str:
+        return json.dumps(asdict(self), ensure_ascii=False)
 
 
-def ensure_dir(path: Path) -> Path:
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+# ── Text extraction ───────────────────────────────────────────────────────────
+def extract_text_pdf(path: Path, max_chars: int = MAX_TEXT_CHARS) -> str:
+    """Extract raw text from PDF, truncated to max_chars."""
+    try:
+        reader = PdfReader(str(path))
+        parts = []
+        total = 0
+        for page in reader.pages:
+            t = page.extract_text() or ""
+            parts.append(t)
+            total += len(t)
+            if total >= max_chars:
+                break
+        return "\n".join(parts)[:max_chars]
+    except Exception as e:
+        log.warning(f"PDF read error {path.name}: {e}")
+        return ""
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# SESSION MANAGEMENT
-# ──────────────────────────────────────────────────────────────────────────────
-
-def get_session_dir(session_id: str) -> Path:
-    return UPLOADS_DIR / session_id
-
-
-def init_session(session_id: str) -> dict:
-    d = get_session_dir(session_id)
-    ensure_dir(d / "original")
-    ensure_dir(d / "processed")
-    ensure_dir(d / "chunks")
-    return {"session_id": session_id, "path": str(d)}
-
-
-def list_sessions() -> list:
-    sessions = []
-    if not UPLOADS_DIR.exists():
-        return sessions
-    for entry in UPLOADS_DIR.iterdir():
-        if not entry.is_dir():
-            continue
-        stat = entry.stat()
-        size = _calc_dir_size(entry)
-        file_count = sum(1 for f in entry.rglob("*") if f.is_file())
-        meta_path = entry / "metadata.json"
-        metadata = None
-        if meta_path.exists():
-            try:
-                metadata = json.loads(meta_path.read_text("utf-8"))
-            except Exception:
-                pass
-        sessions.append({
-            "id": entry.name,
-            "created_at": datetime.fromtimestamp(stat.st_ctime).strftime("%Y-%m-%d %H:%M"),
-            "modified_at": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
-            "modified_ts": stat.st_mtime,
-            "file_size": size,
-            "file_size_fmt": format_size(size),
-            "file_count": file_count,
-            "metadata": metadata,
-        })
-    sessions.sort(key=lambda x: x["modified_ts"], reverse=True)
-    return sessions
+def extract_text_docx(path: Path, max_chars: int = MAX_TEXT_CHARS) -> str:
+    """Extract raw text from DOCX."""
+    try:
+        doc = DocxDocument(str(path))
+        parts = [p.text for p in doc.paragraphs if p.text.strip()]
+        # Also grab table cells
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    parts.append(cell.text.strip())
+        return "\n".join(parts)[:max_chars]
+    except Exception as e:
+        log.warning(f"DOCX read error {path.name}: {e}")
+        return ""
 
 
-def get_session_detail(session_id: str) -> Optional[dict]:
-    session_path = get_session_dir(session_id)
-    if not session_path.exists():
-        return None
-    structure = {}
-    for subdir in ["original", "processed", "chunks"]:
-        sub = session_path / subdir
-        if sub.exists():
-            structure[subdir] = [
-                {
-                    "name": f.name,
-                    "size": f.stat().st_size,
-                    "size_fmt": format_size(f.stat().st_size),
-                    "modified": datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
-                }
-                for f in sub.iterdir()
-                if f.is_file()
-            ]
-    meta_path = session_path / "metadata.json"
-    metadata = json.loads(meta_path.read_text("utf-8")) if meta_path.exists() else None
-    return {"session_id": session_id, "metadata": metadata, "structure": structure}
-
-
-def delete_session(session_id: str) -> dict:
-    session_path = get_session_dir(session_id)
-    if not session_path.exists():
-        return {"success": False, "error": "Session not found"}
-    size = _calc_dir_size(session_path)
-    shutil.rmtree(session_path)
-    return {"success": True, "freed_bytes": size, "freed_fmt": format_size(size)}
-
-
-def cleanup_old_sessions(max_age_hours: int = 24, exclude_id: str = "") -> dict:
-    max_age_ms = max_age_hours * 3600 * 1000
-    now = time.time() * 1000
-    deleted, freed = 0, 0
-    if not UPLOADS_DIR.exists():
-        return {"deleted": 0, "freed_bytes": 0, "freed_fmt": "0 B"}
-    for entry in UPLOADS_DIR.iterdir():
-        if not entry.is_dir():
-            continue
-        if entry.name == exclude_id:
-            continue
-        age_ms = now - entry.stat().st_mtime * 1000
-        if age_ms > max_age_ms:
-            size = _calc_dir_size(entry)
-            shutil.rmtree(entry)
-            freed += size
-            deleted += 1
-    return {"deleted": deleted, "freed_bytes": freed, "freed_fmt": format_size(freed)}
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Hapus SEMUA session (kecuali session aktif)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def delete_all_sessions(exclude_id: str = "") -> dict:
-    """
-    Delete ALL sessions from disk, except the one matching exclude_id.
-    Returns count of deleted sessions and total freed bytes.
-    """
-    deleted, freed = 0, 0
-    if not UPLOADS_DIR.exists():
-        return {"deleted": 0, "freed_bytes": 0, "freed_fmt": "0 B"}
-    for entry in list(UPLOADS_DIR.iterdir()):
-        if not entry.is_dir():
-            continue
-        if entry.name == exclude_id:
-            continue
-        size = _calc_dir_size(entry)
-        shutil.rmtree(entry)
-        freed += size
-        deleted += 1
-    return {"deleted": deleted, "freed_bytes": freed, "freed_fmt": format_size(freed)}
-
-
-def _calc_dir_size(path: Path) -> int:
-    return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# FILE SAVING
-# ──────────────────────────────────────────────────────────────────────────────
-
-def save_uploaded_file(session_id: str, uploaded_file) -> dict:
-    """Save a Streamlit UploadedFile to disk. Returns file info dict."""
-    session_dir = get_session_dir(session_id)
-    original_dir = ensure_dir(session_dir / "original")
-
-    safe_name = re.sub(r"[^a-zA-Z0-9._\-]", "_", uploaded_file.name)
-    unique_name = f"{int(time.time() * 1000)}_{safe_name}"
-    dest = original_dir / unique_name
-
-    content = uploaded_file.read()
-    dest.write_bytes(content)
-
-    return {
-        "original_name": uploaded_file.name,
-        "saved_name": unique_name,
-        "path": str(dest),
-        "size": len(content),
-        "size_fmt": format_size(len(content)),
-        "ext": Path(uploaded_file.name).suffix.lower(),
-        "session_id": session_id,
-    }
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# TEXT EXTRACTION  (PDF, DOC, DOCX, TXT, MD, Images)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def extract_text_from_file(file_path: str, file_ext: str) -> str:
-    """Extract raw text from PDF / DOC / DOCX / TXT / MD / image files."""
-    p = Path(file_path)
-    ext = file_ext.lower()
-
-    # ── Plain text ──
-    if ext in (".txt", ".md"):
-        for enc in ("utf-8", "latin-1", "cp1252"):
-            try:
-                return p.read_text(enc)
-            except UnicodeDecodeError:
-                continue
-        return p.read_bytes().decode("utf-8", errors="replace")
-
-    # ── PDF ──
-    elif ext == ".pdf":
-        try:
-            import pypdf
-            reader = pypdf.PdfReader(str(p))
-            pages = []
-            for page in reader.pages:
-                text = page.extract_text()
-                if text:
-                    pages.append(text)
-            extracted = "\n\n".join(pages)
-            if len(extracted.strip()) >= 50:
-                return extracted
-        except ImportError:
-            pass
-        return _extract_pdf_fallback(p)
-
-    # ── DOCX ──
-    elif ext == ".docx":
-        try:
-            import docx as python_docx
-            doc = python_docx.Document(str(p))
-            parts = [para.text for para in doc.paragraphs if para.text.strip()]
-            for table in doc.tables:
-                for row in table.rows:
-                    for cell in row.cells:
-                        if cell.text.strip():
-                            parts.append(cell.text.strip())
-            return "\n\n".join(parts)
-        except ImportError:
-            return _extract_docx_fallback(p)
-
-    # ── DOC (legacy) ──
-    elif ext == ".doc":
-        return _extract_doc_legacy(p)
-
-    # ── Excel XLSX ──
-    elif ext == ".xlsx":
-        return _extract_excel_text(p, engine="openpyxl")
-
-    # ── Excel XLS (legacy) ──
-    elif ext == ".xls":
-        return _extract_excel_text(p, engine="xlrd")
-
-    # ── Images (OCR) ──
-    elif ext in IMAGE_EXTENSIONS:
-        return _extract_image_text(p)
-
+def extract_text(path: Path) -> str:
+    """Route to correct extractor by extension."""
+    ext = path.suffix.lower()
+    if ext == ".pdf":
+        return extract_text_pdf(path)
+    elif ext in (".docx", ".doc"):
+        return extract_text_docx(path)
     return ""
 
 
-def _extract_pdf_fallback(p: Path) -> str:
-    try:
-        import subprocess
-        result = subprocess.run(
-            ["pdftotext", str(p), "-"],
-            capture_output=True, text=True, timeout=120
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout
-    except Exception:
-        pass
-    return f"[Cannot extract PDF: {p.name}. Install pypdf or pdftotext]"
-
-
-def _extract_docx_fallback(p: Path) -> str:
-    try:
-        import zipfile
-        import xml.etree.ElementTree as ET
-        texts = []
-        with zipfile.ZipFile(str(p)) as z:
-            with z.open("word/document.xml") as f:
-                tree = ET.parse(f)
-                ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
-                for t in tree.findall(".//w:t", ns):
-                    if t.text:
-                        texts.append(t.text)
-        return " ".join(texts)
-    except Exception:
-        return f"[Cannot extract DOCX: {p.name}. Install python-docx]"
-
-
-def _extract_doc_legacy(p: Path) -> str:
-    """Extract text from legacy .doc files."""
-    try:
-        import subprocess
-        result = subprocess.run(
-            ["antiword", str(p)],
-            capture_output=True, text=True, timeout=60
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout
-    except Exception:
-        pass
-
-    try:
-        import subprocess, tempfile
-        with tempfile.TemporaryDirectory() as tmpdir:
-            subprocess.run(
-                ["libreoffice", "--headless", "--convert-to", "txt:Text", "--outdir", tmpdir, str(p)],
-                capture_output=True, timeout=120
-            )
-            txt_file = Path(tmpdir) / (p.stem + ".txt")
-            if txt_file.exists():
-                return txt_file.read_text("utf-8", errors="replace")
-    except Exception:
-        pass
-
-    try:
-        raw = p.read_bytes()
-        texts = re.findall(rb"[\x20-\x7e]{4,}", raw)
-        return " ".join(t.decode("ascii", errors="replace") for t in texts)
-    except Exception:
-        return f"[Cannot extract DOC: {p.name}. Install antiword or LibreOffice]"
-
-
-def _extract_excel_text(p: Path, engine: str = "openpyxl") -> str:
-    """Extract text from Excel files (.xlsx with openpyxl, .xls with xlrd)."""
-    try:
-        import pandas as pd
-        xl = pd.ExcelFile(str(p), engine=engine)
-        parts = []
-        for sheet_name in xl.sheet_names:
-            df = xl.parse(sheet_name)
-            if df.empty:
-                continue
-            parts.append(f"=== Sheet: {sheet_name} ===")
-            # Header row
-            parts.append("\t".join(str(c) for c in df.columns))
-            # Data rows
-            for _, row in df.iterrows():
-                row_text = "\t".join("" if (str(v) == "nan") else str(v) for v in row)
-                if row_text.strip():
-                    parts.append(row_text)
-        return "\n".join(parts) if parts else f"[Empty Excel file: {p.name}]"
-    except ImportError as e:
-        missing = "openpyxl" if engine == "openpyxl" else "xlrd"
-        return f"[Cannot extract Excel: install {missing}. Error: {e}]"
-    except Exception as e:
-        return f"[Cannot extract Excel: {p.name}. Error: {e}]"
-
-
-def _extract_image_text(p: Path) -> str:
-    """Extract text from image using pytesseract OCR."""
-    try:
-        import pytesseract
-        from PIL import Image
-        img = Image.open(str(p))
-        if img.mode not in ("RGB", "L"):
-            img = img.convert("RGB")
+# ── Gemini call ───────────────────────────────────────────────────────────────
+def call_gemini(model, text: str) -> Optional[dict]:
+    """Send text to Gemini, return parsed dict or None."""
+    prompt = GEMINI_PROMPT.replace("{text}", text)
+    for attempt in range(1, RETRY_LIMIT + 1):
         try:
-            text = pytesseract.image_to_string(img, lang="ind+eng")
-        except Exception:
-            text = pytesseract.image_to_string(img)
-        return text.strip()
-    except Exception as e:
-        return f"[Image: {p.name} — Install pytesseract + Tesseract OCR for text extraction. Error: {e}]"
+            response = model.generate_content(prompt)
+            raw = response.text.strip()
+            # Strip accidental markdown fences
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+            return json.loads(raw)
+        except json.JSONDecodeError as e:
+            log.warning(f"JSON parse fail attempt {attempt}: {e}")
+        except Exception as e:
+            log.warning(f"Gemini error attempt {attempt}: {e}")
+            time.sleep(RETRY_DELAY * attempt)
+    return None
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# CHUNKING
-# ──────────────────────────────────────────────────────────────────────────────
-
-def clean_text(text: str, remove_extra_spaces: bool = True, remove_special: bool = False) -> str:
-    if remove_extra_spaces:
-        text = re.sub(r"\s+", " ", text).strip()
-        text = re.sub(r"\n{3,}", "\n\n", text)
-    if remove_special:
-        text = re.sub(r"[^\w\s.,!?;:()\-\'\"\n]", "", text)
-    return text.strip()
+# ── Post-process & validate ───────────────────────────────────────────────────
+def guess_category_from_text(text: str) -> str:
+    text_low = text.lower()
+    for kw, cat in CATEGORY_MAP.items():
+        if kw in text_low:
+            return cat
+    return "Lainnya"
 
 
-def chunk_text(
-    text: str,
-    chunk_size: int = 512,
-    overlap: int = 50,
-    method: str = "tokens",
-) -> list:
-    text = text.strip()
-    if not text:
-        return []
-
-    if method == "paragraphs":
-        paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
-        chunks, current = [], ""
-        for para in paras:
-            if len((current + " " + para).split()) <= chunk_size:
-                current = (current + " " + para).strip()
-            else:
-                if current:
-                    chunks.append(current)
-                current = para
-        if current:
-            chunks.append(current)
-        return chunks
-
-    elif method == "sentences":
-        sentences = re.split(r"(?<=[.!?])\s+", text)
-        chunks, current_words = [], []
-        for sent in sentences:
-            words = sent.split()
-            if len(current_words) + len(words) <= chunk_size:
-                current_words.extend(words)
-            else:
-                if current_words:
-                    chunks.append(" ".join(current_words))
-                current_words = current_words[-overlap:] + words if overlap else words
-        if current_words:
-            chunks.append(" ".join(current_words))
-        return chunks
-
-    else:  # tokens (word-based)
-        words = text.split()
-        chunks = []
-        i = 0
-        while i < len(words):
-            end = min(i + chunk_size, len(words))
-            chunks.append(" ".join(words[i:end]))
-            i += chunk_size - overlap
-            if i < 0:
-                i = chunk_size
-        return chunks
+def guess_sni_id_from_filename(filename: str) -> tuple[str, str]:
+    """Try to parse SNI number from filename like 'SNI_01-3701-1995.pdf'"""
+    m = re.search(r"(\d{2}-\d{4}-\d{4})", filename)
+    if m:
+        sni_id = m.group(1)
+        return sni_id, f"SNI {sni_id}"
+    return "", ""
 
 
-def _process_single_file(args) -> dict:
-    """Process a single file — used by parallel executor."""
-    info, settings = args
-    chunk_size = int(settings.get("chunk_size", 512))
-    overlap = int(settings.get("overlap", 50))
-    method = settings.get("chunk_method", "tokens")
-    remove_spaces = settings.get("remove_extra_spaces", True)
-    remove_special = settings.get("remove_special_chars", False)
-    source_tag = settings.get("source_tag", "")
-    output_format = settings.get("output_format", "training")
+def post_process(raw: dict, path: Path, source_text: str) -> SNIRecord:
+    """Clean and validate extracted fields."""
+    rec = SNIRecord()
+
+    # sni_id / no_sni
+    rec.sni_id = str(raw.get("sni_id", "")).strip()
+    rec.no_sni = str(raw.get("no_sni", "")).strip()
+    if not rec.sni_id:
+        rec.sni_id, rec.no_sni = guess_sni_id_from_filename(path.name)
+
+    # judul
+    rec.judul = str(raw.get("judul", path.stem)).strip()
+
+    # kategori
+    cat = str(raw.get("kategori", "")).strip()
+    # Validate against known categories
+    valid_cats = set(CATEGORY_MAP.values()) | {"Lainnya"}
+    rec.kategori = cat if cat in valid_cats else guess_category_from_text(source_text)
+
+    # ruang_lingkup — enforce max length
+    scope = str(raw.get("ruang_lingkup", "")).strip()
+    rec.ruang_lingkup = scope[:MAX_SCOPE_CHARS]
+
+    # persyaratan & metode_uji — keep as-is, fallback to "-"
+    rec.persyaratan = str(raw.get("persyaratan", "-")).strip() or "-"
+    rec.metode_uji = str(raw.get("metode_uji", "-")).strip() or "-"
+
+    # keywords — enforce max 20 words
+    kw = str(raw.get("keywords", "")).strip()
+    words = kw.split()[:MAX_KW_WORDS]
+    rec.keywords = " ".join(words)
+
+    return rec
+
+
+# ── File discovery ─────────────────────────────────────────────────────────────
+def discover_files(folder: Path) -> list[Path]:
+    """Return all PDF/DOCX files in folder (recursive)."""
+    exts = {".pdf", ".docx", ".doc"}
+    files = [p for p in folder.rglob("*") if p.suffix.lower() in exts and p.is_file()]
+    files.sort()
+    return files
+
+
+# ── Checkpoint helpers ────────────────────────────────────────────────────────
+def file_hash(path: Path) -> str:
+    return hashlib.md5(path.name.encode()).hexdigest()
+
+
+def load_done_set(checkpoint_file: Path) -> set[str]:
+    done = set()
+    if checkpoint_file.exists():
+        for line in checkpoint_file.read_text().splitlines():
+            done.add(line.strip())
+    return done
+
+
+def mark_done(checkpoint_file: Path, h: str):
+    with checkpoint_file.open("a") as f:
+        f.write(h + "\n")
+
+
+# ── Main processing pipeline ──────────────────────────────────────────────────
+def process_folder(
+    api_key: str,
+    input_folder: Path,
+    output_file: Path,
+    checkpoint_file: Path,
+    rpm_limit: int = 15,
+    progress_callback=None,
+) -> Generator[dict, None, None]:
+    """
+    Generator that processes files one-by-one and yields status dicts:
+      {"file": str, "status": "ok"|"skip"|"error", "record": SNIRecord|None, "msg": str}
+    """
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(GEMINI_MODEL)
+
+    files = discover_files(input_folder)
+    total = len(files)
+    done_set = load_done_set(checkpoint_file)
+
+    # Open output in append mode so we can resume
+    out_f = output_file.open("a", encoding="utf-8")
+
+    # Rate limiting: track request timestamps
+    req_times: list[float] = []
+    min_interval = 60.0 / rpm_limit  # seconds per request
 
     try:
-        raw = extract_text_from_file(info["path"], info["ext"])
-        if not raw.strip():
-            return {
-                "file_result": {**info, "status": "empty", "chunks": 0},
-                "items": [],
-                "chars": 0,
-            }
-
-        cleaned = clean_text(raw, remove_spaces, remove_special)
-        chunks = chunk_text(cleaned, chunk_size, overlap, method)
-        items = []
-
-        for idx, chunk in enumerate(chunks):
-            if output_format == "qa":
-                item = {"instruction": "", "input": chunk, "output": ""}
-            elif output_format == "messages":
-                item = {
-                    "messages": [
-                        {"role": "system", "content": "You are a helpful assistant."},
-                        {"role": "user", "content": chunk},
-                        {"role": "assistant", "content": ""},
-                    ]
-                }
-            else:
-                item = {
-                    "id": f"{info['session_id']}_tmp_{idx:04d}",
-                    "text": chunk,
-                    "source": source_tag or info["original_name"],
-                    "chunk_index": idx + 1,
-                    "total_chunks_in_doc": len(chunks),
-                }
-            items.append(item)
-
-        return {
-            "file_result": {**info, "status": "success", "chunks": len(chunks)},
-            "items": items,
-            "chars": len(cleaned),
-        }
-
-    except Exception as e:
-        return {
-            "file_result": {**info, "status": "error", "error": str(e), "chunks": 0},
-            "items": [],
-            "chars": 0,
-        }
-
-
-def process_documents(
-    file_infos: list,
-    settings: dict,
-    max_workers: int = 12,
-    progress_callback=None,
-) -> dict:
-    """Process a list of saved file infos into training data using parallel workers."""
-    all_results = [None] * len(file_infos)
-    total = len(file_infos)
-    completed_count = [0]
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_idx = {
-            executor.submit(_process_single_file, (info, settings)): i
-            for i, info in enumerate(file_infos)
-        }
-        for future in as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            all_results[idx] = future.result()
-            completed_count[0] += 1
-            if progress_callback:
-                progress_callback("extract", completed_count[0], total, file_infos[idx]["original_name"])
-
-    all_items = []
-    file_results = []
-    stats = {
-        "total_files": len(file_infos),
-        "processed_files": 0,
-        "failed_files": 0,
-        "total_chunks": 0,
-        "total_chars": 0,
-    }
-
-    for res in all_results:
-        if res is None:
-            continue
-        file_results.append(res["file_result"])
-        all_items.extend(res["items"])
-        if res["file_result"]["status"] == "success":
-            stats["processed_files"] += 1
-            stats["total_chunks"] += res["file_result"]["chunks"]
-            stats["total_chars"] += res["chars"]
-        else:
-            stats["failed_files"] += 1
-
-    session_id = file_infos[0]["session_id"] if file_infos else "sess"
-    for i, item in enumerate(all_items):
-        if isinstance(item, dict) and "id" in item:
-            item["id"] = f"{session_id}_{i + 1:04d}"
-
-    return {
-        "version": "1.0",
-        "type": "training",
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "settings": settings,
-        "stats": stats,
-        "file_results": file_results,
-        "total": len(all_items),
-        "total_chunks": len(all_items),
-        "data": all_items,
-    }
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# PARAPHRASE ENGINE (WITHOUT API)
-# ──────────────────────────────────────────────────────────────────────────────
-
-# Words that must NEVER be replaced during paraphrasing (normative/modal terms)
-PROTECTED_WORDS = {
-    # English normative
-    "shall", "should", "must", "may", "can", "will", "would",
-    # Indonesian normative
-    "harus", "sebaiknya", "wajib", "boleh", "dapat", "tidak boleh",
-    "dilarang", "dipersyaratkan", "direkomendasikan", "diperbolehkan",
-}
-
-
-def _replace_synonyms(text: str, synonyms_dict: dict, replace_prob: float = 0.7) -> str:
-    """Replace words with their synonyms based on probability, preserving protected words."""
-    words = text.split()
-    for i, word in enumerate(words):
-        clean_word = re.sub(r'[^\w]', '', word.lower())
-        # Skip protected normative/modal words — never replace them
-        if clean_word in PROTECTED_WORDS:
-            continue
-        if clean_word in synonyms_dict and random.random() < replace_prob:
-            synonyms = synonyms_dict[clean_word]
-            synonym = random.choice(synonyms)
-            punctuation = re.findall(r'[^\w]', word)
-            if punctuation:
-                words[i] = synonym + punctuation[-1] if punctuation[-1] else synonym
-            else:
-                words[i] = synonym
-    return " ".join(words)
-
-
-def _rephrase_sentence_structure(text: str) -> str:
-    """Slightly modify sentence structure without changing meaning."""
-    sentences = re.split(r'(?<=[.!?])\s+', text)
-    rephrased = []
-
-    for sentence in sentences:
-        if len(sentence.split()) < 5:
-            rephrased.append(sentence)
-            continue
-
-        # Don't restructure sentences containing normative/modal words
-        sentence_lower = sentence.lower()
-        has_protected = any(pw in sentence_lower.split() or
-                            f" {pw} " in f" {sentence_lower} "
-                            for pw in PROTECTED_WORDS)
-        if has_protected:
-            rephrased.append(sentence)
-            continue
-
-        if ',' in sentence:
-            parts = sentence.split(',', 1)
-            if len(parts) == 2 and random.random() < 0.3:
-                sentence = f"{parts[1].strip()} {parts[0].strip()}"
-                sentence = sentence[0].upper() + sentence[1:]
-
-        rephrased.append(sentence)
-
-    return " ".join(rephrased)
-
-
-def _add_transitional_phrases(text: str) -> str:
-    """Add or modify transitional phrases."""
-    indonesian_transitions = [
-        "Selain itu, ", "Sebagai tambahan, ", "Di sisi lain, ",
-        "Dalam konteks ini, ", "Sehubungan dengan itu, ", "Pada dasarnya, "
-    ]
-    english_transitions = [
-        "Additionally, ", "Furthermore, ", "On the other hand, ",
-        "In this context, ", "Related to this, ", "Essentially, "
-    ]
-
-    if len(text.split()) < 30:
-        return text
-
-    if random.random() < 0.2:
-        if any(word in text.lower() for word in ["dan", "yang", "dengan", "untuk", "dari"]):
-            transition = random.choice(indonesian_transitions)
-        else:
-            transition = random.choice(english_transitions)
-        text = transition + text
-
-    return text
-
-
-def paraphrase_text(text: str, language: str = "auto") -> str:
-    """
-    Paraphrase text without using an API.
-    Default language is 'auto' for auto-detection.
-    """
-    if not text.strip():
-        return text
-
-    if language == "id":
-        synonyms = INDONESIAN_SYNONYMS
-    elif language == "en":
-        synonyms = ENGLISH_SYNONYMS
-    else:
-        # Auto-detect language (simple heuristic)
-        if any(word in text.lower() for word in ["dan", "yang", "dengan", "untuk", "dari"]):
-            synonyms = INDONESIAN_SYNONYMS
-        else:
-            synonyms = ENGLISH_SYNONYMS
-
-    paraphrased = _replace_synonyms(text, synonyms)
-    paraphrased = _rephrase_sentence_structure(paraphrased)
-    paraphrased = _add_transitional_phrases(paraphrased)
-
-    return paraphrased
-
-
-def _paraphrase_item_task(args) -> tuple:
-    """Returns (index, paraphrased_item)."""
-    import copy
-    idx, item, language = args
-    item = copy.deepcopy(item)
-    try:
-        if "text" in item:
-            item["text"] = paraphrase_text(item["text"], language)
-        elif "input" in item:
-            item["input"] = paraphrase_text(item["input"], language)
-        elif "messages" in item:
-            for msg in item["messages"]:
-                if msg.get("role") == "user" and msg.get("content"):
-                    msg["content"] = paraphrase_text(msg["content"], language)
-    except Exception:
-        pass
-    return idx, item
-
-
-def paraphrase_dataset(
-    result: dict,
-    language: str = "auto",
-    progress_callback=None,
-    max_workers: int = 10,
-) -> dict:
-    """
-    Paraphrase every text field in result['data'] using parallel processing.
-    Default language is 'auto' for auto-detection.
-    """
-    import copy
-    new_result = copy.deepcopy(result)
-    items = new_result.get("data", [])
-    total = len(items)
-    paraphrased_items = [None] * total
-
-    completed_count = [0]
-    tasks = [(i, item, language) for i, item in enumerate(items)]
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(_paraphrase_item_task, task): task[0] for task in tasks}
-        for future in as_completed(futures):
-            idx, para_item = future.result()
-            paraphrased_items[idx] = para_item
-            completed_count[0] += 1
-            if progress_callback:
-                progress_callback(completed_count[0], total)
-
-    if progress_callback:
-        progress_callback(total, total)
-
-    new_result["data"] = paraphrased_items
-    new_result["paraphrased"] = True
-    new_result["paraphrase_language"] = language
-    new_result["paraphrased_at"] = datetime.now(timezone.utc).isoformat()
-    return new_result
-
-
-def process_and_paraphrase(
-    file_infos: list,
-    settings: dict,
-    language: str = "auto",
-    progress_callback=None,
-) -> dict:
-    """
-    One-shot: extract text from files, chunk, then immediately paraphrase.
-    Default language is 'auto' for auto-detection.
-    progress_callback(stage: str, current: int, total: int)
-    """
-    if progress_callback:
-        progress_callback("extract", 0, len(file_infos), "")
-
-    def _extract_cb(stage, cur, tot, fname=""):
-        if progress_callback:
-            progress_callback(stage, cur, tot, fname)
-
-    result = process_documents(file_infos, settings, max_workers=12, progress_callback=_extract_cb)
-
-    if progress_callback:
-        progress_callback("extract", len(file_infos), len(file_infos), "")
-
-    def _para_cb(current, total):
-        if progress_callback:
-            progress_callback("paraphrase", current, total, "")
-
-    para_result = paraphrase_dataset(result, language, _para_cb, max_workers=10)
-    return para_result
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# SAVE PROCESSED DATA
-# ──────────────────────────────────────────────────────────────────────────────
-
-def save_processed_data(session_id: str, data: dict, settings: dict) -> dict:
-    session_dir = get_session_dir(session_id)
-    processed_dir = ensure_dir(session_dir / "processed")
-    chunks_dir = ensure_dir(session_dir / "chunks")
-
-    output_path = processed_dir / "output.json"
-    output_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
-
-    chunk_count = 0
-    if isinstance(data.get("data"), list):
-        def _write_chunk(args):
-            i, item = args
-            (chunks_dir / f"chunk_{i + 1:03d}.json").write_text(
-                json.dumps(item, ensure_ascii=False, indent=2), "utf-8"
-            )
-            return i
-
-        with ThreadPoolExecutor(max_workers=20) as executor:
-            results = list(executor.map(_write_chunk, enumerate(data["data"])))
-            chunk_count = len(results)
-
-    metadata = {
-        "session_id": session_id,
-        "saved_at": datetime.now(timezone.utc).isoformat(),
-        "settings": settings,
-        "stats": {
-            "total_chunks": chunk_count,
-            "output_file": str(output_path),
-            "chunks_directory": str(chunks_dir),
-        },
-    }
-    (session_dir / "metadata.json").write_text(
-        json.dumps(metadata, ensure_ascii=False, indent=2), "utf-8"
-    )
-
-    return {
-        "success": True,
-        "processed_path": str(output_path),
-        "chunks_saved": chunk_count,
-    }
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# JSON MERGER
-# ──────────────────────────────────────────────────────────────────────────────
-
-def detect_merge_strategy(parsed_files: list, strategy: str = "auto") -> str:
-    if strategy != "auto":
-        return strategy
-    if all(isinstance(f["content"], dict) and isinstance(f["content"].get("data"), list)
-           for f in parsed_files):
-        return "data"
-    if all(isinstance(f["content"], list) for f in parsed_files):
-        return "array"
-    return "object"
-
-
-def merge_json_files(file_contents: list, strategy: str = "auto") -> dict:
-    merge_mode = detect_merge_strategy(file_contents, strategy)
-    stats = {
-        "files_count": len(file_contents),
-        "merge_mode": merge_mode,
-        "item_counts": [],
-    }
-
-    if merge_mode == "data":
-        all_items = []
-        for f in file_contents:
-            items = f["content"].get("data", [])
-            all_items.extend(items)
-            stats["item_counts"].append({"file": f["name"], "items": len(items)})
-        merged = {
-            "version": "1.0",
-            "type": "training",
-            "merged": True,
-            "merged_at": datetime.now(timezone.utc).isoformat(),
-            "source_files": [f["name"] for f in file_contents],
-            "total": len(all_items),
-            "total_chunks": len(all_items),
-            "data": all_items,
-        }
-
-    elif merge_mode == "array":
-        all_items = []
-        for f in file_contents:
-            c = f["content"]
-            if isinstance(c, list):
-                arr = c
-            elif isinstance(c, dict) and isinstance(c.get("data"), list):
-                arr = c["data"]
-            elif isinstance(c, dict):
-                arr = [c]
-            else:
-                arr = []
-            all_items.extend(arr)
-            stats["item_counts"].append({"file": f["name"], "items": len(arr)})
-        merged = all_items
-
-    else:
-        merged = {
-            "_merged": True,
-            "_merged_at": datetime.now(timezone.utc).isoformat(),
-            "_source_files": [f["name"] for f in file_contents],
-        }
-        for f in file_contents:
-            src = f["content"] if isinstance(f["content"], dict) else {"_array_data": f["content"]}
-            merged.update(src)
-            stats["item_counts"].append({"file": f["name"], "keys": len(src)})
-
-    return {"merged": merged, "merge_mode": merge_mode, "stats": stats}
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SNI CORE EXTRACTOR  — output: sni_core.jsonl
-# ══════════════════════════════════════════════════════════════════════════════
-
-import urllib.request
-import urllib.error
-import base64
-
-_SNI_SYSTEM_PROMPT = """\
-Kamu adalah ekstraktor data dokumen SNI (Standar Nasional Indonesia) yang sangat presisi.
-Baca dokumen SNI yang diberikan (bisa gambar cover, teks penuh, atau keduanya) lalu kembalikan \
-HANYA satu JSON object — tanpa markdown fence, tanpa komentar, tanpa teks tambahan.
-
-━━━ SCHEMA WAJIB (10 field, urutan tetap) ━━━
-{
-  "sni_id": "...",
-  "no_sni": "...",
-  "judul": "...",
-  "tahun": 0,
-  "kategori": "...",
-  "ruang_lingkup": "...",
-  "persyaratan": "...",
-  "metode_uji": "...",
-  "keywords": "...",
-  "halaman": 0
-}
-
-━━━ CARA MENGISI SETIAP FIELD ━━━
-
-sni_id  (string)
-  • Ambil dari baris header cover, contoh: "SNI ISO 22739:2024"
-  • Hapus kata "SNI" dan spasi di depan, ganti ":" dengan "_", ganti " " dengan "_"
-  • Contoh hasil: "ISO_22739_2024" atau "01-3701-1995"
-  • Jika format "SNI DD-NNNN:YYYY" → hasilkan "DD-NNNN_YYYY"
-
-no_sni  (string)
-  • Nomor SNI LENGKAP persis seperti tertulis di cover, termasuk kata "SNI"
-  • Contoh: "SNI ISO 22739:2024" atau "SNI 01-3701-1995"
-
-judul  (string)
-  • Judul BAHASA INDONESIA dari cover (bukan judul bahasa Inggris)
-  • Bersihkan tanda baca trailing (titik, koma, dll)
-  • Contoh: "Blockchain dan teknologi buku besar terdistribusi — Kosakata"
-
-tahun  (integer)
-  • Tahun penetapan SNI — ambil dari nomor SNI atau baris "(Ditetapkan oleh BSN tahun YYYY)"
-  • Jika ada dua angka tahun, pakai tahun di nomor SNI
-  • Harus integer, bukan string
-
-kategori  (string)
-  • Bidang/topik SNI berdasarkan kode ICS yang tertera di cover (pojok kiri bawah)
-  • Pemetaan kode ICS → kategori:
-      01.xxx  → Umum, Terminologi
-      11.xxx  → Kesehatan, Kedokteran
-      13.xxx  → Lingkungan, Keselamatan
-      23.xxx  → Fluid systems, Komponen
-      25.xxx  → Manufaktur, Teknik
-      35.xxx  → Teknologi Informasi, Telekomunikasi
-      43.xxx  → Kendaraan Bermotor
-      55.xxx  → Kemasan, Distribusi Barang
-      65.xxx  → Pertanian, Pangan
-      67.xxx  → Teknologi Pangan, Minuman
-      71.xxx  → Kimia, Industri Kimia
-      73.xxx  → Pertambangan, Mineral
-      77.xxx  → Metalurgi
-      91.xxx  → Konstruksi, Material Bangunan
-      93.xxx  → Teknik Sipil
-  • Jika kode ICS tidak ada di daftar: gunakan deskripsi singkat bidang dari judul
-
-ruang_lingkup  (string)
-  • Ringkasan SINGKAT isi/cakupan standar, 1–2 kalimat, MAKSIMAL 150 karakter
-  • Jika dokumen hanya cover/halaman depan: tulis ruang lingkup berdasarkan judul
-  • Jangan melebihi 150 karakter — potong di batas kalimat
-
-persyaratan  (string)
-  PRIORITAS 1 — Pasal persyaratan/syarat mutu/baku mutu/kualitas:
-    • Cari pasal/seksi dengan judul mengandung kata: persyaratan, syarat mutu, baku mutu,
-      kualitas, requirements, specifications
-    • Jika ditemukan tabel dengan angka + satuan: format tiap baris sebagai
-      "NamaParameter = NilaiAngka Satuan harus/maks/min/sebaiknya", pisahkan dengan " | "
-    • Contoh: "E.coli = 0 /100ml harus | Arsen = maks 0,05 mg/L harus | pH = 6,5–8,5 harus"
-
-  PRIORITAS 2 — Kalimat normatif dari seluruh dokumen (jika tidak ada tabel syarat mutu):
-    • Kumpulkan kalimat/frasa yang mengandung kata normatif:
-      "harus", "wajib", "sebaiknya", "shall", "should", "must"
-    • Ambil paling banyak 10 persyaratan paling penting/representatif
-    • Format tiap item ringkas: "KlausaXX.YY: ringkasan persyaratan"
-      contoh: "5.1.1: Kebijakan keamanan informasi harus didefinisikan dan dikomunikasikan"
-    • Pisahkan item dengan " | "
-    • TOTAL panjang field tidak boleh melebihi 800 karakter
-
-  PRIORITAS 3 — Hanya jika dokumen adalah murni kosakata/vocabulary/terminologi atau hanya cover:
-    • Isi "-"
-
-metode_uji  (string)
-  PRIORITAS 1 — Pasal/seksi metode uji eksplisit:
-    • Cari pasal dengan judul: metode uji, pengujian, uji, test method, testing, verification
-    • Jika ditemukan: format "Parameter/Aspek = MetodeUji/KodeStandar kondisi"
-      contoh: "Kuat tarik = SNI ASTM E8 suhu ruang | Kadar air = SNI 01-2891-1992"
-    • Pisahkan item dengan " | "
-
-  PRIORITAS 2 — Referensi pengujian/verifikasi dalam teks (jika tidak ada pasal khusus):
-    • Cari kalimat/frasa mengandung kata: uji, pengujian, test, testing, verifikasi,
-      verification, audit, review, pemeriksaan, assessment
-    • Ambil paling banyak 8 item paling penting
-    • Format: "KlausaXX.YY: ringkasan aktivitas pengujian/verifikasi"
-      contoh: "12.7.1: Audit sistem informasi harus dilakukan secara berkala"
-    • Pisahkan item dengan " | "
-    • TOTAL panjang field tidak boleh melebihi 600 karakter
-
-  PRIORITAS 3 — Hanya jika benar-benar tidak ada satupun referensi uji/verifikasi:
-    • Isi "-"
-
-keywords  (string)
-  • MAKSIMAL 20 kata, dipisah spasi
-  • Wajib sertakan: nomor SNI (tanpa "SNI"), tahun, kata kunci teknis dari judul
-  • Untuk dokumen kosakata: sertakan istilah-istilah kunci
-  • Buang kata-kata umum: standar nasional indonesia SNI badan persyaratan mutu
-
-halaman  (integer)
-  • Jumlah halaman dokumen jika diketahui, atau 0 jika tidak ada informasi halaman
-
-━━━ CONTOH OUTPUT untuk "SNI ISO/IEC 27017:2015" (standar keamanan informasi) ━━━
-{
-  "sni_id": "ISO_IEC_27017_2015",
-  "no_sni": "SNI ISO/IEC 27017:2015",
-  "judul": "Teknologi informasi – Teknik keamanan – Petunjuk praktik kendali keamanan informasi berdasarkan ISO/IEC 27002 untuk layanan cloud",
-  "tahun": 2015,
-  "kategori": "Teknologi Informasi, Telekomunikasi",
-  "ruang_lingkup": "Panduan kendali keamanan informasi untuk penyedia dan pengguna layanan cloud berdasarkan ISO/IEC 27002.",
-  "persyaratan": "5.1.1: Kebijakan keamanan informasi cloud harus didefinisikan konsisten dengan toleransi risiko organisasi | 6.1.1: Peran dan tanggung jawab keamanan informasi harus disepakati dan didokumentasikan dalam perjanjian | 9.2.3: Teknik autentikasi yang memadai (mis. multi-faktor) harus digunakan untuk administrator cloud | 12.3.1: Spesifikasi backup harus diminta dari penyedia dan diverifikasi memenuhi kebutuhan | 13.1.3: Persyaratan segregasi jaringan untuk isolasi tenant harus didefinisikan dan diverifikasi",
-  "metode_uji": "18.2.1: Bukti dokumenter implementasi kendali keamanan harus diminta dari penyedia cloud | 12.7.1: Audit kontrol sistem informasi harus dilakukan berkala | 18.2.3: Tinjauan kepatuhan teknis harus dilakukan terhadap kebijakan dan standar keamanan",
-  "keywords": "ISO_IEC_27017_2015 cloud keamanan informasi security controls layanan cloud service provider customer 35.030 2015",
-  "halaman": 43
-}
-
-━━━ CONTOH OUTPUT untuk "SNI ISO 22739:2024" (kosakata/vocabulary) ━━━
-{
-  "sni_id": "ISO_22739_2024",
-  "no_sni": "SNI ISO 22739:2024",
-  "judul": "Blockchain dan teknologi buku besar terdistribusi — Kosakata",
-  "tahun": 2024,
-  "kategori": "Teknologi Informasi, Telekomunikasi",
-  "ruang_lingkup": "Standar kosakata untuk blockchain dan teknologi buku besar terdistribusi, adopsi identik ISO 22739:2024.",
-  "persyaratan": "-",
-  "metode_uji": "-",
-  "keywords": "ISO_22739_2024 blockchain distributed ledger kosakata vocabulary 35.030 IDT 2024",
-  "halaman": 0
-}
-
-OUTPUT: JSON object murni saja. Tidak boleh ada teks lain di luar JSON.
-"""
-
-_ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
-_SNI_MODEL = "claude-sonnet-4-20250514"
-
-
-def _call_claude_for_sni(text: str = "", image_b64: str = "", media_type: str = "image/png") -> dict:
-    """
-    Call Claude API to extract SNI fields.
-    Sends image (base64) and/or text content.
-    Returns parsed dict or raises on error.
-    """
-    content = []
-    if image_b64:
-        content.append({
-            "type": "image",
-            "source": {"type": "base64", "media_type": media_type, "data": image_b64},
-        })
-    if text.strip():
-        # Send up to 60 000 chars to cover long multi-clause SNI documents (e.g. 27017, 27001)
-        # that have requirements spread across many clauses — not just the first few pages.
-        content.append({
-            "type": "text",
-            "text": (
-                "Berikut isi dokumen SNI. Ekstrak semua field sesuai instruksi sistem.\n\n"
-                f"{text[:60000]}"
-            ),
-        })
-    if not content:
-        raise ValueError("No content to send to Claude API")
-
-    payload = json.dumps({
-        "model": _SNI_MODEL,
-        "max_tokens": 2500,
-        "system": _SNI_SYSTEM_PROMPT,
-        "messages": [{"role": "user", "content": content}],
-    }).encode("utf-8")
-
-    req = urllib.request.Request(
-        _ANTHROPIC_API_URL,
-        data=payload,
-        headers={"Content-Type": "application/json", "anthropic-version": "2023-06-01"},
-        method="POST",
-    )
-
-    with urllib.request.urlopen(req, timeout=90) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-
-    raw = ""
-    for block in data.get("content", []):
-        if block.get("type") == "text":
-            raw += block["text"]
-
-    raw = raw.strip()
-
-    # Strip markdown code fences (```json ... ``` or ``` ... ```)
-    raw = re.sub(r"^```(?:json)?\s*\n?", "", raw)
-    raw = re.sub(r"\n?\s*```\s*$", "", raw)
-    raw = raw.strip()
-
-    # If Claude prepended explanation text, find the first '{' and last '}'
-    start = raw.find("{")
-    end = raw.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        raw = raw[start : end + 1]
-
-    return json.loads(raw)
-
-
-def _file_to_b64(path: Path) -> tuple[str, str]:
-    """Return (base64_data, media_type) for image files."""
-    ext = path.suffix.lower()
-    mt_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
-              ".webp": "image/webp", ".gif": "image/gif"}
-    media_type = mt_map.get(ext, "image/png")
-    data = base64.b64encode(path.read_bytes()).decode("utf-8")
-    return data, media_type
-
-
-def _normalize_sni_fields(result: dict, raw_text: str, filename: str) -> dict:
-    """
-    Post-process Claude's output to ensure sni_id and no_sni are correct.
-
-    Strategy (priority order):
-      1. Parse no_sni from raw PDF text — most reliable ground truth.
-         Looks for lines like:  SNI ISO/IEC 27017:2015  or  SNI 01-3701-1995
-      2. If raw_text unavailable, try to reconstruct from filename.
-      3. Derive sni_id deterministically from no_sni (never from Claude's guess).
-
-    Also cleans common Claude mistakes:
-      • no_sni using "-" instead of "/" (e.g.  SNI ISO-IEC → SNI ISO/IEC)
-      • no_sni using "_" instead of ":" (e.g.  27017_2015 → 27017:2015)
-      • sni_id missing "ISO_IEC" prefix when the standard is ISO/IEC
-    """
-
-    # ── Step 1: extract canonical no_sni from raw text ──────────────────────
-    canonical_no_sni = ""
-    if raw_text:
-        # Look for "SNI ISO/IEC NNNNN:YYYY" or "SNI ISO NNNNN:YYYY" or "SNI DD-NNNN:YYYY"
-        # Also catch OCR artifacts like "SNI ISO-IEC" or "SNI ISO/IEC"
-        patterns = [
-            # SNI ISO/IEC NNNNN:YYYY  (standard slash form)
-            r"SNI\s+ISO[/ ]IEC\s+[\d]{4,6}(?:[:\-]\d{4})?",
-            # SNI ISO NNNNN:YYYY
-            r"SNI\s+ISO\s+[\d]{4,6}(?:[:\-]\d{4})?",
-            # SNI DD-NNNN:YYYY  (old Indonesian format)
-            r"SNI\s+\d{2,4}[-–]\d{3,5}(?:[:\-]\d{4})?",
-            # SNI NNNNN:YYYY (generic)
-            r"SNI\s+[\d]{4,6}(?:[:\-]\d{4})?",
-        ]
-        for pat in patterns:
-            m = re.search(pat, raw_text)
-            if m:
-                candidate = m.group(0).strip()
-                # Normalise separators to canonical form
-                # "ISO-IEC" → "ISO/IEC", "_" year separator → ":"
-                candidate = re.sub(r"ISO[-\s]IEC", "ISO/IEC", candidate)
-                candidate = re.sub(r"(\d{4,6})_(\d{4})$", r"\1:\2", candidate)
-                canonical_no_sni = candidate
-                break
-
-    # ── Step 2: fall back — reconstruct from filename if text gave nothing ──
-    if not canonical_no_sni:
-        # e.g. "SNI ISO-IEC 27017.pdf" → "SNI ISO/IEC 27017"
-        stem = Path(filename).stem  # "SNI ISO-IEC 27017"
-        stem = re.sub(r"ISO[-\s]IEC", "ISO/IEC", stem)
-        stem = re.sub(r"[-_](\d{4})$", r":\1", stem)  # trailing year
-        stem = stem.replace("_", " ")
-        if stem.upper().startswith("SNI"):
-            canonical_no_sni = stem.strip()
-
-    # ── Step 3: apply to result if we found a better no_sni ─────────────────
-    if canonical_no_sni:
-        result["no_sni"] = canonical_no_sni
-    else:
-        # At minimum, clean up what Claude returned
-        raw_no = result.get("no_sni", "")
-        raw_no = re.sub(r"ISO[-\s]IEC", "ISO/IEC", raw_no)
-        raw_no = re.sub(r"(\d{4,6})[_\-](\d{4})$", r"\1:\2", raw_no)
-        if raw_no:
-            result["no_sni"] = raw_no
-
-    # ── Step 4: always derive sni_id deterministically from no_sni ──────────
-    no_sni = result.get("no_sni", "")
-    if no_sni:
-        # Remove leading "SNI " prefix
-        sni_id = re.sub(r"^SNI\s+", "", no_sni).strip()
-        # "ISO/IEC" → "ISO_IEC"
-        sni_id = sni_id.replace("/", "_")
-        # ":" → "_"  (year separator)
-        sni_id = sni_id.replace(":", "_")
-        # spaces → "_"
-        sni_id = re.sub(r"\s+", "_", sni_id)
-        # collapse multiple underscores
-        sni_id = re.sub(r"_+", "_", sni_id)
-        # remove trailing/leading underscores
-        sni_id = sni_id.strip("_")
-        result["sni_id"] = sni_id
-
-    return result
-
-
-def extract_sni_from_file(file_info: dict) -> dict:
-    """
-    Extract SNI fields from a single file.
-    Strategy:
-      - Image files → send as image directly to Claude (cover page visual)
-      - PDF        → send full text; if text thin (<100 chars), also send p.1 as image
-      - DOCX/TXT  → send extracted text
-    Returns the sni_core dict, always includes '_source_file'.
-    On error, includes '_error' key.
-    """
-    p = Path(file_info["path"])
-    ext = file_info["ext"].lower()
-
-    try:
-        if ext in IMAGE_EXTENSIONS:
-            # Cover-page image → best visual context
-            b64, mt = _file_to_b64(p)
-            result = _call_claude_for_sni(image_b64=b64, media_type=mt)
-
-        elif ext == ".pdf":
-            text = extract_text_from_file(file_info["path"], ext)
-            text_ok = len(text.strip()) >= 100
-
-            # Always try to get page-1 image for visual cover context
-            cover_b64 = ""
-            try:
-                from pdf2image import convert_from_path
-                import io as _io
-                pages = convert_from_path(str(p), first_page=1, last_page=1, dpi=150)
-                if pages:
-                    buf = _io.BytesIO()
-                    pages[0].save(buf, format="PNG")
-                    cover_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-            except Exception:
-                pass  # pdf2image not installed or failed — fall through
-
-            if cover_b64 and text_ok:
-                # Best case: visual cover + full text
-                result = _call_claude_for_sni(
-                    text=text, image_b64=cover_b64, media_type="image/png"
-                )
-            elif cover_b64:
-                result = _call_claude_for_sni(image_b64=cover_b64, media_type="image/png")
-            else:
-                result = _call_claude_for_sni(text=text)
-
-        else:
-            # DOCX, TXT, MD, etc.
-            text = extract_text_from_file(file_info["path"], ext)
-            result = _call_claude_for_sni(text=text)
-
-        # Normalise — fill in any missing keys with safe defaults
-        defaults = {
-            "sni_id": "", "no_sni": "", "judul": "", "tahun": 0,
-            "kategori": "", "ruang_lingkup": "", "persyaratan": "-",
-            "metode_uji": "-", "keywords": "", "halaman": 0,
-        }
-        for k, v in defaults.items():
-            if k not in result:
-                result[k] = v
-
-        # Coerce numeric fields
-        for int_key in ("tahun", "halaman"):
-            try:
-                result[int_key] = int(result[int_key])
-            except (TypeError, ValueError):
-                result[int_key] = 0
-
-        # Post-process: fix sni_id and no_sni using raw text as ground truth
-        raw_text = ""
-        if ext == ".pdf":
-            raw_text = extract_text_from_file(file_info["path"], ext)
-        result = _normalize_sni_fields(result, raw_text, file_info["original_name"])
-
-        result["_source_file"] = file_info["original_name"]
-        return result
-
-    except Exception as e:
-        return {
-            "_error": str(e),
-            "_source_file": file_info["original_name"],
-            "sni_id": "", "no_sni": "", "judul": "",
-            "tahun": 0, "kategori": "", "ruang_lingkup": "",
-            "persyaratan": "-", "metode_uji": "-",
-            "keywords": "", "halaman": 0,
-        }
-
-
-def process_sni_documents(
-    file_infos: list,
-    max_workers: int = 4,
-    progress_callback=None,
-) -> dict:
-    """
-    Process a list of SNI documents in parallel.
-    Returns dict with 'records' (list of sni_core dicts), 'stats'.
-    """
-    total = len(file_infos)
-    results = [None] * total
-    completed = [0]
-
-    def _task(args):
-        idx, info = args
-        return idx, extract_sni_from_file(info)
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(_task, (i, info)): i for i, info in enumerate(file_infos)}
-        for future in as_completed(futures):
-            idx, res = future.result()
-            results[idx] = res
-            completed[0] += 1
-            if progress_callback:
-                progress_callback(completed[0], total, res.get("_source_file", ""))
-
-    records = [r for r in results if r is not None]
-    ok = [r for r in records if "_error" not in r or not r.get("_error")]
-    err = [r for r in records if r.get("_error")]
-
-    return {
-        "records": records,
-        "stats": {
-            "total": total,
-            "success": len(ok),
-            "error": len(err),
-            "errors": [{"file": r["_source_file"], "error": r["_error"]} for r in err],
-        },
-    }
-
-
-def build_sni_jsonl(records: list) -> str:
-    """
-    Convert list of sni_core dicts to JSONL string.
-    Each line = 1 JSON object. No array, no trailing comma.
-    Strips internal '_source_file' key from output.
-    """
-    _CORE_KEYS = ["sni_id", "no_sni", "judul", "tahun", "kategori",
-                  "ruang_lingkup", "persyaratan", "metode_uji", "keywords", "halaman"]
-    lines = []
-    for rec in records:
-        obj = {k: rec.get(k, "" if k not in ("tahun", "halaman") else 0) for k in _CORE_KEYS}
-        lines.append(json.dumps(obj, ensure_ascii=False))
-    return "\n".join(lines)
+        for idx, path in enumerate(files, 1):
+            h = file_hash(path)
+            status_base = {"file": path.name, "index": idx, "total": total}
+
+            if h in done_set:
+                yield {**status_base, "status": "skip", "record": None, "msg": "already processed"}
+                continue
+
+            # Rate limiting
+            now = time.time()
+            req_times = [t for t in req_times if now - t < 60]
+            if len(req_times) >= rpm_limit:
+                wait = 60 - (now - req_times[0]) + 0.5
+                log.info(f"Rate limit: sleeping {wait:.1f}s")
+                time.sleep(wait)
+
+            # Extract text
+            text = extract_text(path)
+            if not text.strip():
+                yield {**status_base, "status": "error", "record": None, "msg": "empty text extracted"}
+                mark_done(checkpoint_file, h)
+                continue
+
+            # Call Gemini
+            req_times.append(time.time())
+            raw = call_gemini(model, text)
+
+            if raw is None:
+                yield {**status_base, "status": "error", "record": None, "msg": "Gemini returned no valid JSON"}
+                continue
+
+            # Post-process
+            rec = post_process(raw, path, text)
+            line = rec.to_jsonl_line()
+            out_f.write(line + "\n")
+            out_f.flush()
+            mark_done(checkpoint_file, h)
+
+            yield {**status_base, "status": "ok", "record": rec, "msg": ""}
+
+    finally:
+        out_f.close()
+
+
+# ── Stats helper ──────────────────────────────────────────────────────────────
+def count_jsonl_lines(path: Path) -> int:
+    if not path.exists():
+        return 0
+    with path.open(encoding="utf-8") as f:
+        return sum(1 for _ in f)

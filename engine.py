@@ -1030,17 +1030,43 @@ ruang_lingkup  (string)
   • Jangan melebihi 150 karakter — potong di batas kalimat
 
 persyaratan  (string)
-  • Jika dokumen mengandung tabel syarat mutu: ekstrak SEMUA baris yang punya angka + satuan
-  • Format tiap item: "NamaParameter = NilaiAngka Satuan harus/maks/min/sebaiknya"
-  • Pisahkan item dengan " | "
-  • Contoh: "E.coli = 0 /100ml harus | Arsen = maks 0,05 mg/L harus | pH = 6,5–8,5 harus"
-  • Jika dokumen adalah kosakata/terminologi/vocabulary TANPA tabel syarat: isi "-"
-  • Jika dokumen hanya cover: isi "-"
+  PRIORITAS 1 — Pasal persyaratan/syarat mutu/baku mutu/kualitas:
+    • Cari pasal/seksi dengan judul mengandung kata: persyaratan, syarat mutu, baku mutu,
+      kualitas, requirements, specifications
+    • Jika ditemukan tabel dengan angka + satuan: format tiap baris sebagai
+      "NamaParameter = NilaiAngka Satuan harus/maks/min/sebaiknya", pisahkan dengan " | "
+    • Contoh: "E.coli = 0 /100ml harus | Arsen = maks 0,05 mg/L harus | pH = 6,5–8,5 harus"
+
+  PRIORITAS 2 — Kalimat normatif dari seluruh dokumen (jika tidak ada tabel syarat mutu):
+    • Kumpulkan kalimat/frasa yang mengandung kata normatif:
+      "harus", "wajib", "sebaiknya", "shall", "should", "must"
+    • Ambil paling banyak 10 persyaratan paling penting/representatif
+    • Format tiap item ringkas: "KlausaXX.YY: ringkasan persyaratan"
+      contoh: "5.1.1: Kebijakan keamanan informasi harus didefinisikan dan dikomunikasikan"
+    • Pisahkan item dengan " | "
+    • TOTAL panjang field tidak boleh melebihi 800 karakter
+
+  PRIORITAS 3 — Hanya jika dokumen adalah murni kosakata/vocabulary/terminologi atau hanya cover:
+    • Isi "-"
 
 metode_uji  (string)
-  • Jika ada referensi metode pengujian eksplisit: format "Parameter = KodeSNI NamaMetode kondisi"
-  • Pisahkan item dengan " | "
-  • Jika tidak ada: isi "-"
+  PRIORITAS 1 — Pasal/seksi metode uji eksplisit:
+    • Cari pasal dengan judul: metode uji, pengujian, uji, test method, testing, verification
+    • Jika ditemukan: format "Parameter/Aspek = MetodeUji/KodeStandar kondisi"
+      contoh: "Kuat tarik = SNI ASTM E8 suhu ruang | Kadar air = SNI 01-2891-1992"
+    • Pisahkan item dengan " | "
+
+  PRIORITAS 2 — Referensi pengujian/verifikasi dalam teks (jika tidak ada pasal khusus):
+    • Cari kalimat/frasa mengandung kata: uji, pengujian, test, testing, verifikasi,
+      verification, audit, review, pemeriksaan, assessment
+    • Ambil paling banyak 8 item paling penting
+    • Format: "KlausaXX.YY: ringkasan aktivitas pengujian/verifikasi"
+      contoh: "12.7.1: Audit sistem informasi harus dilakukan secara berkala"
+    • Pisahkan item dengan " | "
+    • TOTAL panjang field tidak boleh melebihi 600 karakter
+
+  PRIORITAS 3 — Hanya jika benar-benar tidak ada satupun referensi uji/verifikasi:
+    • Isi "-"
 
 keywords  (string)
   • MAKSIMAL 20 kata, dipisah spasi
@@ -1051,7 +1077,21 @@ keywords  (string)
 halaman  (integer)
   • Jumlah halaman dokumen jika diketahui, atau 0 jika tidak ada informasi halaman
 
-━━━ CONTOH OUTPUT untuk "SNI ISO 22739:2024" ━━━
+━━━ CONTOH OUTPUT untuk "SNI ISO/IEC 27017:2015" (standar keamanan informasi) ━━━
+{
+  "sni_id": "ISO_IEC_27017_2015",
+  "no_sni": "SNI ISO/IEC 27017:2015",
+  "judul": "Teknologi informasi – Teknik keamanan – Petunjuk praktik kendali keamanan informasi berdasarkan ISO/IEC 27002 untuk layanan cloud",
+  "tahun": 2015,
+  "kategori": "Teknologi Informasi, Telekomunikasi",
+  "ruang_lingkup": "Panduan kendali keamanan informasi untuk penyedia dan pengguna layanan cloud berdasarkan ISO/IEC 27002.",
+  "persyaratan": "5.1.1: Kebijakan keamanan informasi cloud harus didefinisikan konsisten dengan toleransi risiko organisasi | 6.1.1: Peran dan tanggung jawab keamanan informasi harus disepakati dan didokumentasikan dalam perjanjian | 9.2.3: Teknik autentikasi yang memadai (mis. multi-faktor) harus digunakan untuk administrator cloud | 12.3.1: Spesifikasi backup harus diminta dari penyedia dan diverifikasi memenuhi kebutuhan | 13.1.3: Persyaratan segregasi jaringan untuk isolasi tenant harus didefinisikan dan diverifikasi",
+  "metode_uji": "18.2.1: Bukti dokumenter implementasi kendali keamanan harus diminta dari penyedia cloud | 12.7.1: Audit kontrol sistem informasi harus dilakukan berkala | 18.2.3: Tinjauan kepatuhan teknis harus dilakukan terhadap kebijakan dan standar keamanan",
+  "keywords": "ISO_IEC_27017_2015 cloud keamanan informasi security controls layanan cloud service provider customer 35.030 2015",
+  "halaman": 43
+}
+
+━━━ CONTOH OUTPUT untuk "SNI ISO 22739:2024" (kosakata/vocabulary) ━━━
 {
   "sni_id": "ISO_22739_2024",
   "no_sni": "SNI ISO 22739:2024",
@@ -1085,12 +1125,13 @@ def _call_claude_for_sni(text: str = "", image_b64: str = "", media_type: str = 
             "source": {"type": "base64", "media_type": media_type, "data": image_b64},
         })
     if text.strip():
-        # Send first 20 000 chars — covers most SNI documents fully
+        # Send up to 60 000 chars to cover long multi-clause SNI documents (e.g. 27017, 27001)
+        # that have requirements spread across many clauses — not just the first few pages.
         content.append({
             "type": "text",
             "text": (
                 "Berikut isi dokumen SNI. Ekstrak semua field sesuai instruksi sistem.\n\n"
-                f"{text[:20000]}"
+                f"{text[:60000]}"
             ),
         })
     if not content:
@@ -1098,7 +1139,7 @@ def _call_claude_for_sni(text: str = "", image_b64: str = "", media_type: str = 
 
     payload = json.dumps({
         "model": _SNI_MODEL,
-        "max_tokens": 1500,
+        "max_tokens": 2500,
         "system": _SNI_SYSTEM_PROMPT,
         "messages": [{"role": "user", "content": content}],
     }).encode("utf-8")

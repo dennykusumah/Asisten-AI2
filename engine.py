@@ -1185,6 +1185,89 @@ def _file_to_b64(path: Path) -> tuple[str, str]:
     return data, media_type
 
 
+def _normalize_sni_fields(result: dict, raw_text: str, filename: str) -> dict:
+    """
+    Post-process Claude's output to ensure sni_id and no_sni are correct.
+
+    Strategy (priority order):
+      1. Parse no_sni from raw PDF text — most reliable ground truth.
+         Looks for lines like:  SNI ISO/IEC 27017:2015  or  SNI 01-3701-1995
+      2. If raw_text unavailable, try to reconstruct from filename.
+      3. Derive sni_id deterministically from no_sni (never from Claude's guess).
+
+    Also cleans common Claude mistakes:
+      • no_sni using "-" instead of "/" (e.g.  SNI ISO-IEC → SNI ISO/IEC)
+      • no_sni using "_" instead of ":" (e.g.  27017_2015 → 27017:2015)
+      • sni_id missing "ISO_IEC" prefix when the standard is ISO/IEC
+    """
+
+    # ── Step 1: extract canonical no_sni from raw text ──────────────────────
+    canonical_no_sni = ""
+    if raw_text:
+        # Look for "SNI ISO/IEC NNNNN:YYYY" or "SNI ISO NNNNN:YYYY" or "SNI DD-NNNN:YYYY"
+        # Also catch OCR artifacts like "SNI ISO-IEC" or "SNI ISO/IEC"
+        patterns = [
+            # SNI ISO/IEC NNNNN:YYYY  (standard slash form)
+            r"SNI\s+ISO[/ ]IEC\s+[\d]{4,6}(?:[:\-]\d{4})?",
+            # SNI ISO NNNNN:YYYY
+            r"SNI\s+ISO\s+[\d]{4,6}(?:[:\-]\d{4})?",
+            # SNI DD-NNNN:YYYY  (old Indonesian format)
+            r"SNI\s+\d{2,4}[-–]\d{3,5}(?:[:\-]\d{4})?",
+            # SNI NNNNN:YYYY (generic)
+            r"SNI\s+[\d]{4,6}(?:[:\-]\d{4})?",
+        ]
+        for pat in patterns:
+            m = re.search(pat, raw_text)
+            if m:
+                candidate = m.group(0).strip()
+                # Normalise separators to canonical form
+                # "ISO-IEC" → "ISO/IEC", "_" year separator → ":"
+                candidate = re.sub(r"ISO[-\s]IEC", "ISO/IEC", candidate)
+                candidate = re.sub(r"(\d{4,6})_(\d{4})$", r"\1:\2", candidate)
+                canonical_no_sni = candidate
+                break
+
+    # ── Step 2: fall back — reconstruct from filename if text gave nothing ──
+    if not canonical_no_sni:
+        # e.g. "SNI ISO-IEC 27017.pdf" → "SNI ISO/IEC 27017"
+        stem = Path(filename).stem  # "SNI ISO-IEC 27017"
+        stem = re.sub(r"ISO[-\s]IEC", "ISO/IEC", stem)
+        stem = re.sub(r"[-_](\d{4})$", r":\1", stem)  # trailing year
+        stem = stem.replace("_", " ")
+        if stem.upper().startswith("SNI"):
+            canonical_no_sni = stem.strip()
+
+    # ── Step 3: apply to result if we found a better no_sni ─────────────────
+    if canonical_no_sni:
+        result["no_sni"] = canonical_no_sni
+    else:
+        # At minimum, clean up what Claude returned
+        raw_no = result.get("no_sni", "")
+        raw_no = re.sub(r"ISO[-\s]IEC", "ISO/IEC", raw_no)
+        raw_no = re.sub(r"(\d{4,6})[_\-](\d{4})$", r"\1:\2", raw_no)
+        if raw_no:
+            result["no_sni"] = raw_no
+
+    # ── Step 4: always derive sni_id deterministically from no_sni ──────────
+    no_sni = result.get("no_sni", "")
+    if no_sni:
+        # Remove leading "SNI " prefix
+        sni_id = re.sub(r"^SNI\s+", "", no_sni).strip()
+        # "ISO/IEC" → "ISO_IEC"
+        sni_id = sni_id.replace("/", "_")
+        # ":" → "_"  (year separator)
+        sni_id = sni_id.replace(":", "_")
+        # spaces → "_"
+        sni_id = re.sub(r"\s+", "_", sni_id)
+        # collapse multiple underscores
+        sni_id = re.sub(r"_+", "_", sni_id)
+        # remove trailing/leading underscores
+        sni_id = sni_id.strip("_")
+        result["sni_id"] = sni_id
+
+    return result
+
+
 def extract_sni_from_file(file_info: dict) -> dict:
     """
     Extract SNI fields from a single file.
@@ -1252,6 +1335,12 @@ def extract_sni_from_file(file_info: dict) -> dict:
                 result[int_key] = int(result[int_key])
             except (TypeError, ValueError):
                 result[int_key] = 0
+
+        # Post-process: fix sni_id and no_sni using raw text as ground truth
+        raw_text = ""
+        if ext == ".pdf":
+            raw_text = extract_text_from_file(file_info["path"], ext)
+        result = _normalize_sni_fields(result, raw_text, file_info["original_name"])
 
         result["_source_file"] = file_info["original_name"]
         return result

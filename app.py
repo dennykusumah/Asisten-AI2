@@ -382,6 +382,8 @@ def init_state():
         "save_result": None, "merger_files": [], "merge_result": None,
         "active_tab": "process", "paraphrase_running": False,
         "uploader_key": 0, "merger_uploader_key": 0,
+        # SNI Extractor
+        "sni_files": [], "sni_result": None, "sni_uploader_key": 0,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -442,7 +444,7 @@ settings = {
 # ──────────────────────────────────────────────────────────────────────────────
 
 st.markdown("""<div class="page-header"><h1 class="page-title">🤖 Generator Dataset</h1><p class="page-subtitle">Mengubah dokumen menjadi data pelatihan AI berkualitas tinggi.</p></div>""", unsafe_allow_html=True)
-tab_process, tab_merge, tab_sessions = st.tabs(["📄 Process Documents", "🔀 Merge JSON Files", "📂 Session Manager"])
+tab_process, tab_merge, tab_sessions, tab_sni = st.tabs(["📄 Process Documents", "🔀 Merge JSON Files", "📂 Session Manager", "📋 SNI Extractor"])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -780,3 +782,173 @@ with tab_sessions:
                         if st.button("🔄 Switch", key=f"sw_{s['id']}", use_container_width=True): st.session_state.session_id = s["id"]; st.session_state.uploaded_files = []; st.session_state.processed_result = None; st.session_state.uploader_key += 1; st.rerun()
                         if st.button("🗑️ Delete", key=f"del_{s['id']}", use_container_width=True): engine.delete_session(s["id"]); st.success("✅ Deleted"); st.rerun()
                     else: st.markdown('<div class="status-saved" style="text-align:center;">Current</div>', unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 4 — SNI EXTRACTOR (sni_core.jsonl)
+# ══════════════════════════════════════════════════════════════════════════════
+
+with tab_sni:
+    st.markdown("""<div class="page-header" style="margin-bottom:1.5rem;">
+        <h2 style="font-size:1.4rem;font-weight:700;color:#a5f3fc !important;-webkit-text-fill-color:#a5f3fc !important;margin:0;">
+            📋 SNI Extractor — <code>sni_core.jsonl</code></h2>
+        <p style="color:#cbd5e1 !important;-webkit-text-fill-color:#cbd5e1 !important;font-size:0.88rem;margin-top:4px;">
+            Upload dokumen SNI (PDF, DOCX, gambar). Claude mengekstrak field terstruktur dan output <strong>sni_core.jsonl</strong> — 1 baris per SNI.</p>
+    </div>""", unsafe_allow_html=True)
+
+    col_su, col_sr = st.columns([1, 1], gap="large")
+
+    # ── LEFT: Upload ──────────────────────────────────────────────────────────
+    with col_su:
+        st.markdown('<div class="section-header">📤 Upload Dokumen SNI</div>', unsafe_allow_html=True)
+
+        sni_uploads = st.file_uploader(
+            "Upload SNI",
+            type=["pdf", "docx", "jpg", "jpeg", "png", "webp"],
+            accept_multiple_files=True,
+            key=f"sni_uploader_{st.session_state.get('sni_uploader_key', 0)}",
+        )
+
+        if sni_uploads:
+            added = 0
+            existing_names = {f["original_name"] for f in st.session_state.sni_files}
+            for uf in sni_uploads:
+                if uf.name not in existing_names:
+                    fi = engine.save_uploaded_file(st.session_state.session_id, uf)
+                    st.session_state.sni_files.append(fi)
+                    added += 1
+            if added:
+                st.success(f"✅ {added} file ditambahkan!")
+                st.rerun()
+
+        if st.session_state.sni_files:
+            for fi in st.session_state.sni_files:
+                ext = fi["ext"].lstrip(".")
+                badge_cls = f"badge-{ext}" if ext in ("pdf","docx","png","jpg","jpeg","webp") else "badge-txt"
+                st.markdown(
+                    f'<div class="file-item">'
+                    f'<span class="file-badge {badge_cls}">{ext.upper()}</span>'
+                    f'<div style="flex:1;min-width:0;">'
+                    f'<div class="file-name">{fi["original_name"]}</div>'
+                    f'<div class="file-size">{fi["size_fmt"]}</div>'
+                    f'</div></div>', unsafe_allow_html=True)
+
+            st.markdown("<br>", unsafe_allow_html=True)
+            bc1, bc2 = st.columns(2)
+            with bc1:
+                if st.button(
+                    f"🔍 Ekstrak {len(st.session_state.sni_files)} SNI",
+                    use_container_width=True, type="primary", key="btn_sni_extract"
+                ):
+                    prog = st.progress(0.0)
+                    status_ph = st.empty()
+
+                    def _sni_cb(done, total, fname):
+                        prog.progress(done / max(total, 1))
+                        status_ph.markdown(
+                            f'<div style="font-size:0.82rem;color:#94a3b8;">⏳ ({done}/{total}) {fname}</div>',
+                            unsafe_allow_html=True)
+
+                    with st.spinner("Menghubungi Claude API…"):
+                        st.session_state.sni_result = engine.process_sni_documents(
+                            st.session_state.sni_files,
+                            max_workers=3,
+                            progress_callback=_sni_cb,
+                        )
+                    prog.progress(1.0)
+                    status_ph.empty()
+                    st.success("✅ Selesai!")
+                    st.rerun()
+
+            with bc2:
+                if st.button("🔄 Reset", use_container_width=True, key="btn_sni_reset"):
+                    st.session_state.sni_files = []
+                    st.session_state.sni_result = None
+                    st.session_state.sni_uploader_key = st.session_state.get("sni_uploader_key", 0) + 1
+                    st.rerun()
+        else:
+            st.markdown("""<div style="text-align:center;padding:3rem 1rem;">
+                <div style="font-size:3rem;margin-bottom:1rem;">📋</div>
+                <div class="empty-state-title">Upload dokumen SNI</div>
+                <div class="empty-state-desc">PDF, DOCX, atau gambar cover SNI</div>
+            </div>""", unsafe_allow_html=True)
+
+    # ── RIGHT: Results ────────────────────────────────────────────────────────
+    with col_sr:
+        st.markdown('<div class="section-header">📊 Hasil Ekstraksi</div>', unsafe_allow_html=True)
+
+        if st.session_state.sni_result:
+            res = st.session_state.sni_result
+            stats = res["stats"]
+            records = res["records"]
+
+            # Stats row
+            sc1, sc2, sc3 = st.columns(3)
+            for col, val, label, color in [
+                (sc1, stats["total"],   "Total",   "#a5f3fc"),
+                (sc2, stats["success"], "Berhasil","#6ee7b7"),
+                (sc3, stats["error"],   "Gagal",   "#fca5a5"),
+            ]:
+                with col:
+                    st.markdown(
+                        f'<div class="metric-card"><div class="metric-value" '
+                        f'style="color:{color} !important;-webkit-text-fill-color:{color} !important;">'
+                        f'{val}</div><div class="metric-label">{label}</div></div>',
+                        unsafe_allow_html=True)
+
+            # Error detail
+            if stats["errors"]:
+                with st.expander("⚠️ Error Detail"):
+                    for e in stats["errors"]:
+                        st.markdown(
+                            f'<div class="summary-row">'
+                            f'<span class="summary-label">{e["file"]}</span>'
+                            f'<span class="summary-value" style="color:#fca5a5 !important;-webkit-text-fill-color:#fca5a5 !important;">{e["error"][:80]}</span>'
+                            f'</div>', unsafe_allow_html=True)
+
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            # JSONL preview (first 2 records, full keys)
+            jsonl_str = engine.build_sni_jsonl(records)
+            preview_lines = jsonl_str.split("\n")[:2]
+            preview_str = "\n".join(preview_lines)
+            st.markdown('<div class="section-header">👁️ Preview (2 baris pertama)</div>', unsafe_allow_html=True)
+            st.code(preview_str, language="json")
+
+            # Per-record expander
+            with st.expander(f"📋 Semua Record ({len(records)})"):
+                for rec in records:
+                    src = rec.get("_source_file", "")
+                    no = rec.get("no_sni") or rec.get("sni_id") or src
+                    err = rec.get("_error")
+                    badge = '<span class="status-error">ERROR</span>' if err else '<span class="status-success">OK</span>'
+                    st.markdown(
+                        f'<div class="summary-row">{badge} '
+                        f'<span class="summary-label" style="flex:1;margin-left:0.5rem;">{no}</span>'
+                        f'<span class="summary-value" style="font-size:0.78rem;">{src}</span>'
+                        f'</div>', unsafe_allow_html=True)
+
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            # Download JSONL
+            jsonl_bytes = jsonl_str.encode("utf-8")
+            st.download_button(
+                "⬇️ Download sni_core.jsonl",
+                data=jsonl_bytes,
+                file_name="sni_core.jsonl",
+                mime="application/jsonl",
+                use_container_width=True,
+                type="primary",
+                key="dl_sni_jsonl",
+            )
+            st.markdown(
+                f'<div class="info-box" style="margin-top:0.75rem;font-size:0.82rem;">'
+                f'✅ <strong>{len(records)}</strong> SNI · '
+                f'<strong>{len(jsonl_bytes):,}</strong> bytes · format: 1 baris = 1 JSON object</div>',
+                unsafe_allow_html=True)
+        else:
+            st.markdown("""<div style="text-align:center;padding:4rem 1rem;">
+                <div style="font-size:3rem;margin-bottom:1rem;">📊</div>
+                <div class="empty-state-title">Hasil muncul di sini</div>
+                <div class="empty-state-desc">Setelah ekstraksi selesai, preview dan download JSONL tersedia</div>
+            </div>""", unsafe_allow_html=True)

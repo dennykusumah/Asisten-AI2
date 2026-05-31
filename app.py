@@ -1,13 +1,12 @@
 """
 app.py — SNI Core Generator · Streamlit UI (Local Processing, No API)
-Upload PDF/Word → local regex/heuristic extraction → sni_core.csv
+Upload PDF/Word → local regex/heuristic extraction → sni_core.jsonl
 Run: streamlit run app.py
 """
 
 import io
 import os
 import re
-import csv
 import json
 import time
 import tempfile
@@ -228,38 +227,17 @@ div[data-testid="stHorizontalBlock"]{gap:10px;}
 </style>
 """, unsafe_allow_html=True)
 
-# ─── CSV field order ───────────────────────────────────────────────────────────
-CSV_FIELDS = ["no_sni", "judul", "kategori", "ruang_lingkup",
-              "persyaratan", "metode_uji", "halaman", "keywords"]
-
-
-def records_to_csv(records: list[dict]) -> bytes:
-    """Konversi list dict ke bytes CSV (UTF-8 BOM agar Excel terbaca)."""
-    buf = io.StringIO()
-    writer = csv.DictWriter(
-        buf, fieldnames=CSV_FIELDS,
-        extrasaction="ignore",
-        lineterminator="\n",
-        quoting=csv.QUOTE_ALL,
-    )
-    writer.writeheader()
-    for rec in records:
-        writer.writerow(rec)
-    return ("\ufeff" + buf.getvalue()).encode("utf-8")
-
-
 # ─── Session State ─────────────────────────────────────────────────────────────
 def _init():
     defs = {
         "running":     False,
         "done":        False,
-        "csv_bytes":   None,
-        "records":     [],        # list of dicts
+        "jsonl_bytes": None,
         "stats":       {"total": 0, "ok": 0, "error": 0},
         "logs":        [],
         "last_rec":    None,
-        "fstatus":     {},        # fname -> "wait"|"proc"|"ok"|"err"
-        "speed":       0.0,
+        "fstatus":     {},   # fname -> "wait"|"proc"|"ok"|"err"
+        "speed":       0.0,  # files/sec
     }
     for k, v in defs.items():
         if k not in st.session_state:
@@ -275,7 +253,7 @@ st.markdown("""
     <div class="brand-icon">📋</div>
     <div>
       <div class="brand-name">SNI Core Generator</div>
-      <div class="brand-sub">Local Processing · No API · PDF &amp; Word → CSV</div>
+      <div class="brand-sub">Local Processing · No API · PDF &amp; Word → JSONL</div>
     </div>
   </div>
   <span class="pill">⚡ 100% Lokal</span>
@@ -283,7 +261,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ─── Metrics ──────────────────────────────────────────────────────────────────
-ms       = S["stats"]
+ms = S["stats"]
 total_up = len(S["fstatus"])
 done_up  = sum(1 for v in S["fstatus"].values() if v in ("ok","err"))
 speed    = S.get("speed", 0.0)
@@ -298,7 +276,7 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-# ─── Two-col layout ────────────────────────────────────────────────────────────
+# ─── Two-col layout via st.columns ────────────────────────────────────────────
 left, right = st.columns([5, 3], gap="small")
 
 # ═══════════════════════════════════════
@@ -307,12 +285,12 @@ left, right = st.columns([5, 3], gap="small")
 with left:
     st.markdown('<div style="padding:20px 4px 0">', unsafe_allow_html=True)
 
+    # Upload
     st.markdown('<div class="sec-head">Upload Dokumen SNI</div>', unsafe_allow_html=True)
     st.markdown("""
     <div class="upload-hint">
       Format: <b>PDF, DOC, DOCX</b> · Bisa upload banyak sekaligus · Proses paralel, tidak butuh internet<br>
-      Ekstraksi dilakukan 100% di lokal: PyMuPDF (layout blok) + python-docx + regex heuristik<br>
-      <b>Output:</b> CSV dengan kolom: no_sni, judul, kategori, ruang_lingkup, persyaratan, metode_uji, halaman, keywords
+      Ekstraksi dilakukan 100% di lokal menggunakan PyMuPDF + python-docx + regex heuristik
     </div>
     """, unsafe_allow_html=True)
 
@@ -324,6 +302,7 @@ with left:
         key="uploader",
     )
 
+    # Track new uploads
     if uploaded:
         for f in uploaded:
             if f.name not in S["fstatus"]:
@@ -331,6 +310,7 @@ with left:
 
     st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
 
+    # Workers slider
     workers = st.select_slider(
         "Worker Paralel",
         options=[1,2,4,6,8,10,12,16],
@@ -340,6 +320,7 @@ with left:
 
     st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
 
+    # Action buttons
     c1, c2 = st.columns([3,1])
     with c1:
         can_start = bool(uploaded and not S["running"])
@@ -352,13 +333,12 @@ with left:
         reset_btn = st.button("↺ Reset", disabled=S["running"], use_container_width=True)
 
     if reset_btn:
-        for key in ["running","done","csv_bytes","last_rec"]:
+        for key in ["running","done","jsonl_bytes","last_rec"]:
             S[key] = False if key == "running" else None
-        S["records"] = []
-        S["stats"]   = {"total":0,"ok":0,"error":0}
-        S["logs"]    = []
+        S["stats"]  = {"total":0,"ok":0,"error":0}
+        S["logs"]   = []
         S["fstatus"] = {}
-        S["speed"]   = 0.0
+        S["speed"]  = 0.0
         st.rerun()
 
     # Progress bar
@@ -378,13 +358,13 @@ with left:
 
     st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
 
-    # Download CSV button
-    if S["csv_bytes"]:
-        n_rec    = S["stats"]["ok"]
-        size_kb  = len(S["csv_bytes"]) // 1024
+    # Download button (shows when done)
+    if S["jsonl_bytes"]:
+        n_rec = S["stats"]["ok"]
+        size_kb = len(S["jsonl_bytes"]) // 1024
         st.download_button(
             label=f"⬇  Download sni_core.csv  ({n_rec} record · {size_kb} KB)",
-            data=S["csv_bytes"],
+            data=S["jsonl_bytes"],
             file_name="sni_core.csv",
             mime="text/csv",
             use_container_width=True,
@@ -397,10 +377,7 @@ with left:
     log_lines = S["logs"][-60:]
     rows = ""
     for ln in log_lines:
-        cls = ("t-ok"   if "✓"    in ln else
-               "t-err"  if "✗"    in ln else
-               "t-warn" if "WARN" in ln else
-               "t-info" if "INFO" in ln else "t-dim")
+        cls = "t-ok" if "✓" in ln else "t-err" if "✗" in ln else "t-warn" if "WARN" in ln else "t-info" if "INFO" in ln else "t-dim"
         escaped = ln.replace("<","&lt;").replace(">","&gt;")
         rows += f'<div class="{cls}">{escaped}</div>'
     st.markdown(f'<div class="terminal">{rows}</div>', unsafe_allow_html=True)
@@ -415,14 +392,16 @@ with right:
 
     # File Queue
     st.markdown('<div class="sec-head">File Queue</div>', unsafe_allow_html=True)
+
     if not S["fstatus"]:
         st.markdown('<div style="color:var(--txt2);font-size:12px;padding:12px 0">Belum ada file...</div>', unsafe_allow_html=True)
     else:
         q_html = ""
-        for fname, fstat in list(S["fstatus"].items())[:25]:
-            ext      = fname.rsplit(".",1)[-1].upper()
+        file_list = list(S["fstatus"].items())
+        for fname, fstat in file_list[:25]:
+            ext = fname.rsplit(".",1)[-1].upper()
             badge_cls = "pdf" if ext == "PDF" else "doc"
-            size_str  = ""
+            size_str = ""
             if uploaded:
                 for uf in uploaded:
                     if uf.name == fname:
@@ -459,10 +438,8 @@ with right:
           <div class="rec-num">{rec.get('no_sni','')}</div>
           <div class="rec-title">{rec.get('judul','')[:70]}</div>
           <div class="rec-cat">{rec.get('kategori','')}</div>
-          <div class="fl">Halaman</div>
-          <div class="fv">{rec.get('halaman', 0)}</div>
           <div class="fl">Ruang Lingkup</div>
-          <div class="fv">{rec.get('ruang_lingkup','')[:200]}</div>
+          <div class="fv">{rec.get('ruang_lingkup','')[:150]}</div>
           <div class="fl">Persyaratan</div>
           <div class="fv">{syarat[:200]}</div>
           <div class="fl">Metode Uji</div>
@@ -472,52 +449,51 @@ with right:
         </div>
         """, unsafe_allow_html=True)
 
-    # CSV preview (last 5 records as table)
-    if S["csv_bytes"] and S["records"]:
+    # CSV preview (last 2 records)
+    if S["jsonl_bytes"]:
         st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
-        st.markdown('<div class="sec-head">Preview CSV</div>', unsafe_allow_html=True)
-        preview = S["records"][-5:]
-        st.markdown(f'<div style="font-size:10px;color:var(--txt2);margin-bottom:6px">{len(S["records"])} record total · menampilkan {len(preview)} terakhir</div>', unsafe_allow_html=True)
-        # Render mini table
-        tbl = "<table style='width:100%;font-size:10px;border-collapse:collapse'>"
-        tbl += "<tr>" + "".join(f"<th style='text-align:left;padding:4px 6px;border-bottom:1px solid #1c2e48;color:#4a6890;text-transform:uppercase;font-size:8px;letter-spacing:1px'>{f}</th>" for f in CSV_FIELDS) + "</tr>"
-        for r in preview:
-            tbl += "<tr>"
-            for f in CSV_FIELDS:
-                v = str(r.get(f,""))
-                display = v[:30] + "…" if len(v) > 30 else v
-                tbl += f"<td style='padding:4px 6px;border-bottom:1px solid #1c2e48;color:#c0d4ec;vertical-align:top'>{display}</td>"
-            tbl += "</tr>"
-        tbl += "</table>"
-        st.markdown(tbl, unsafe_allow_html=True)
+        st.markdown('<div class="sec-head">Preview Output</div>', unsafe_allow_html=True)
+        import io, csv
+        csv_text = S["jsonl_bytes"].decode("utf-8-sig")
+        reader = csv.DictReader(io.StringIO(csv_text), delimiter=";")
+        rows = list(reader)
+        st.markdown(f'<div style="font-size:10px;color:var(--txt2);margin-bottom:6px">{len(rows)} record total</div>', unsafe_allow_html=True)
+        for row in rows[-2:]:
+            try:
+                st.json(row, expanded=False)
+            except Exception:
+                pass
 
     st.markdown("</div>", unsafe_allow_html=True)
 
 
-# ─── Processing Logic ─────────────────────────────────────────────────────────
+# ─── Processing Logic (runs in main thread, updates state) ────────────────────
 if start_btn and uploaded and not S["running"]:
     from engine import process_file
 
-    S["running"]   = True
-    S["done"]      = False
-    S["csv_bytes"] = None
-    S["records"]   = []
-    S["stats"]     = {"total": len(uploaded), "ok": 0, "error": 0}
-    S["logs"]      = [
+    S["running"] = True
+    S["done"]    = False
+    S["jsonl_bytes"] = None
+    S["stats"]   = {"total": len(uploaded), "ok": 0, "error": 0}
+    S["logs"]    = [
         f"[INFO] {len(uploaded)} file akan diproses · {workers} worker paralel",
-        "[INFO] Ekstraksi lokal — PyMuPDF layout-blocks + python-docx + regex heuristik",
-        "[INFO] no_sni diambil dari pojok kanan atas halaman pertama",
+        "[INFO] Ekstraksi lokal — PyMuPDF + python-docx + regex heuristik",
     ]
 
+    # Mark all as waiting
     for uf in uploaded:
         S["fstatus"][uf.name] = "wait"
 
-    file_data = [(uf.name, uf.getvalue()) for uf in uploaded]
+    # Read all file bytes upfront (fast, in-memory)
+    file_data = []
+    for uf in uploaded:
+        file_data.append((uf.name, uf.getvalue()))
 
-    results   = []
-    t_start   = time.time()
+    results = []
+    t_start = time.time()
     completed = 0
 
+    # Mark first batch as proc
     batch_size = min(workers, len(file_data))
     for name, _ in file_data[:batch_size]:
         S["fstatus"][name] = "proc"
@@ -529,9 +505,9 @@ if start_btn and uploaded and not S["running"]:
         }
 
         for future in as_completed(future_to_name):
-            name      = future_to_name[future]
+            name = future_to_name[future]
             completed += 1
-            elapsed   = time.time() - t_start
+            elapsed = time.time() - t_start
             S["speed"] = completed / elapsed if elapsed > 0 else 0
 
             try:
@@ -541,38 +517,52 @@ if start_btn and uploaded and not S["running"]:
                     S["stats"]["error"] += 1
                     S["logs"].append(f"✗ [{completed}/{len(file_data)}] {name} — {rec_dict['_error']}")
                 else:
-                    # Bersihkan internal keys
                     rec_dict.pop("_source", None)
-                    rec_dict.pop("_error",  None)
+                    rec_dict.pop("_error", None)
                     results.append(rec_dict)
                     S["fstatus"][name] = "ok"
                     S["stats"]["ok"]  += 1
                     S["last_rec"] = rec_dict
                     judul_short = rec_dict.get("judul","")[:45]
-                    no_sni      = rec_dict.get("no_sni","?")
-                    halaman     = rec_dict.get("halaman", 0)
-                    S["logs"].append(
-                        f"✓ [{completed}/{len(file_data)}] {name[:30]}"
-                        f" → {no_sni} · {halaman}hal · {judul_short}"
-                    )
+                    no_sni = rec_dict.get("no_sni","?")
+                    S["logs"].append(f"✓ [{completed}/{len(file_data)}] {name[:30]} → {no_sni} · {judul_short}")
             except Exception as e:
                 S["fstatus"][name] = "err"
                 S["stats"]["error"] += 1
                 S["logs"].append(f"✗ [{completed}/{len(file_data)}] {name} — {str(e)[:60]}")
 
-            # Tandai file berikutnya sebagai proc
+            # Mark next queued files as proc
             if completed < len(file_data):
                 next_idx = completed + batch_size - 1
                 if next_idx < len(file_data):
-                    nxt = file_data[next_idx][0]
-                    if S["fstatus"].get(nxt) == "wait":
-                        S["fstatus"][nxt] = "proc"
+                    next_name = file_data[next_idx][0]
+                    if S["fstatus"].get(next_name) == "wait":
+                        S["fstatus"][next_name] = "proc"
 
+    # Build CSV bytes (semicolon-delimited, UTF-8 BOM, no halaman column)
     elapsed_total = time.time() - t_start
-
     if results:
-        S["records"]   = results
-        S["csv_bytes"] = records_to_csv(results)
+        import csv as csv_mod
+        CSV_COLS = ["no_sni", "judul", "kategori", "ruang_lingkup",
+                    "persyaratan", "metode_uji", "keywords"]
+        buf = io.StringIO()
+        writer = csv_mod.DictWriter(
+            buf,
+            fieldnames=CSV_COLS,
+            delimiter=";",
+            extrasaction="ignore",
+            lineterminator="\r\n",
+            quoting=csv_mod.QUOTE_MINIMAL,
+        )
+        writer.writeheader()
+        for rec in results:
+            # Bersihkan newline berlebih di ruang_lingkup agar rapi di CSV
+            rec = dict(rec)
+            if rec.get("ruang_lingkup"):
+                rec["ruang_lingkup"] = re.sub(r'\n{2,}', '\n\n', rec["ruang_lingkup"]).strip()
+            writer.writerow(rec)
+        # BOM UTF-8 agar Excel Indonesia bisa buka
+        S["jsonl_bytes"] = ("\ufeff" + buf.getvalue()).encode("utf-8")
 
     S["running"] = False
     S["done"]    = True

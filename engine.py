@@ -520,123 +520,364 @@ def chunk_text(
 # SNI DOCUMENT FILTER
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Keywords that identify relevant section headings (case-insensitive)
+# ---------------------------------------------------------------------------
+# 1. SECTION KEYWORDS — headings we WANT to keep
+# ---------------------------------------------------------------------------
 _SNI_SECTION_KEYWORDS = [
-    # Judul / nomor SNI (ditangani terpisah di extract_sni_sections)
-    # Ruang lingkup / scope
     r"ruang\s+lingkup", r"\bscope\b",
-    # Persyaratan / mutu / requirement / quality
     r"persyaratan", r"\bmutu\b", r"\brequirement[s]?\b", r"\bquality\b",
     r"syarat\s+mutu", r"spesifikasi", r"\bspecification[s]?\b",
-    # Pengujian / metode uji / uji / testing / test method / test / sampling /
-    # verifikasi / verification / validation / validasi
     r"pengujian", r"metode\s+uji", r"\buji\b", r"\btesting\b",
-    r"test\s+method[s]?", r"\btest[s]?\b", r"\bsampling\b",
+    r"test\s+method[s]?", r"\bsampling\b",
     r"verifikasi", r"\bverification\b", r"\bvalidation\b", r"validasi",
+    r"istilah\s+dan\s+definisi", r"terms?\s+and\s+definitions?",
+    r"acuan\s+normatif", r"normative\s+references?",
+    r"simbol", r"lambang", r"singkatan", r"\bsymbol[s]?\b",
+    r"cara\s+pengambilan", r"pengambilan\s+contoh",
+    r"penandaan", r"pelabelan", r"\bmarking\b", r"\blabelling?\b",
+    r"higiene", r"\bhygiene\b", r"keselamatan", r"\bsafety\b",
+    r"pengemasan", r"\bpackaging\b",
+    r"klasifikasi", r"\bclassification\b",
 ]
 
-# Normative keyword patterns (sentence-level inclusion)
+# ---------------------------------------------------------------------------
+# 2. SECTION KEYWORDS — headings (and their content) to EXCLUDE
+# ---------------------------------------------------------------------------
+_SNI_EXCLUDE_KEYWORDS = [
+    r"daftar\s+isi", r"table\s+of\s+contents?",
+    r"\bpendahuluan\b", r"\bforeword\b", r"\bprakata\b", r"\bintroduction\b",
+    r"\bbibliografi\b", r"\bbibliography\b",
+    r"daftar\s+pustaka", r"\breferensi\b", r"\breferences?\b",
+    r"informasi\s+perumus", r"komite\s+teknis", r"drafting\s+committee",
+    r"panitia\s+teknis", r"technical\s+committee",
+    r"perumus(?:an)?\s+standar", r"penyusun(?:an)?\s+standar",
+    r"keanggotaan\s+komite", r"committee\s+membership",
+    r"kata\s+pengantar",
+    r"lampiran\s+(?:informasi|informative[a-z]*)",
+    r"annex\s+(?:informative[a-z]*|informasi)",
+]
+
+# ---------------------------------------------------------------------------
+# 3. NORMATIVE SENTENCE MARKERS — always kept regardless of section
+# ---------------------------------------------------------------------------
 _NORMATIVE_PATTERNS = [
     r"\bharus\b", r"\bshall\b",
     r"\bsebaiknya\b", r"\bshould\b",
 ]
 
-_SNI_SECTION_RE = re.compile(
-    "|".join(_SNI_SECTION_KEYWORDS), re.IGNORECASE
-)
-_NORMATIVE_RE = re.compile(
-    "|".join(_NORMATIVE_PATTERNS), re.IGNORECASE
-)
-# Matches SNI number patterns, e.g. "SNI 01-3140-2010", "SNI ISO 9001:2015"
-_SNI_NUMBER_RE = re.compile(
-    r"\bSNI(?:\s+(?:ISO|IEC|ASTM|EN|BS))?\s+\d[\w\.\-:/]*(?:[:\-]\d[\w\.\-:/]*){0,3}",
-    re.IGNORECASE
+# ---------------------------------------------------------------------------
+# 4. NOISE LINES — stripped from ALL sections (footer, copyright, page nos)
+# ---------------------------------------------------------------------------
+_NOISE_LINE_RE = re.compile(
+    r"(?:"
+    # copyright symbols and phrases
+    r"©"
+    r"|hak\s+cipta\s+dilindungi"
+    r"|all\s+rights?\s+reserved"
+    r"|dilarang\s+memperbanyak"
+    r"|dilarang\s+mendistribusikan"
+    r"|tanpa\s+izin\s+tertulis"
+    r"|reproduction\s+prohibited"
+    # BSN institutional lines
+    r"|badan\s+standardisasi\s+nasional"
+    r"|standardisasi\s+nasional\s+indonesia"
+    r"|dokinfo@bsn"
+    r"|www\.bsn\.go\.id"
+    r"|diterbitkan\s+di\s+jakarta"
+    r"|email\s*:"
+    # ICS classification lines (e.g. "ICS 67.220.10")
+    r"|^\s*ICS\s+\d"
+    # Lone page numbers
+    r"|^\s*\d{1,4}\s*$"
+    # Page labels
+    r"|halaman\s+\d"
+    r"|page\s+\d+\s+of\s+\d+"
+    r")",
+    re.IGNORECASE,
 )
 
+# ---------------------------------------------------------------------------
+# 5. COVER / PRE-CONTENT NOISE — lines seen on cover and copyright pages
+#    that should never appear in output even if found in "title" pass
+# ---------------------------------------------------------------------------
+_COVER_NOISE_RE = re.compile(
+    r"(?:"
+    r"standar\s+nasional\s+indonesia"      # cover banner
+    r"|national\s+standard\s+of\s+indonesia"
+    r"|^\s*ICS\b"                           # ICS line on cover
+    r"|^\s*SNI\s+\d[\w\.\-:]*\s*$"         # bare SNI number line (cover stamp)
+    r"|badan\s+standardisasi"
+    r"|diterbitkan"
+    r"|tanpa\s+izin"
+    r"|dilarang"
+    r"|bentuk\s+apapun"
+    r"|secara\s+elektronik"
+    r"|pangkal\s+bsn"
+    r"|tercetak"
+    r"|dokinfo"
+    r"|www\.bsn"
+    r"|email\s*:"
+    r")",
+    re.IGNORECASE,
+)
+
+# ---------------------------------------------------------------------------
+# 6. COMPILED REGEXES
+# ---------------------------------------------------------------------------
+_SNI_SECTION_RE  = re.compile("|".join(_SNI_SECTION_KEYWORDS),  re.IGNORECASE)
+_SNI_EXCLUDE_RE  = re.compile("|".join(_SNI_EXCLUDE_KEYWORDS),  re.IGNORECASE)
+_NORMATIVE_RE    = re.compile("|".join(_NORMATIVE_PATTERNS),    re.IGNORECASE)
+
+# SNI ID pattern — strict: "SNI 4:2025", "SNI 01-3140-2010", "SNI ISO 9001:2015"
+# Must be at start of line or after whitespace, and look like a primary identifier
+# (not a mid-sentence citation reference)
+_SNI_ID_LINE_RE = re.compile(
+    r"^\s*SNI(?:\s+(?:ISO|IEC|ASTM|EN|BS))?[\s\-]+\d[\w\.\-:/]*(?:[:\-]\d[\w\.\-:/]*)?\s*$",
+    re.IGNORECASE,
+)
+# For page-header extraction: short standalone SNI line (≤ 30 chars)
+_SNI_HEADER_RE = re.compile(
+    r"^SNI(?:\s+(?:ISO|IEC|ASTM|EN|BS))?[\s\-]+[\w\.\-:/]+(?:[\s\-:]\d[\w\.\-:/]*)?\s*$",
+    re.IGNORECASE,
+)
+
+# Heading: numbered section "1.", "2.1.", up to 55 chars after the number
+_HEADING_RE = re.compile(r"^\d{1,2}(?:\.\d+)*\.?\s+\S.{0,54}$")
+
+# Unnumbered heading: short pure-word line matching a known keyword
+_UNNUMBERED_KW_RE = re.compile(r"^[A-Za-z][A-Za-zÀ-ÿ\s]{2,50}$")
+
+# ToC entry pattern: line with trailing dots and/or page number
+_TOC_LINE_RE = re.compile(r"\.{3,}|\s{3,}\d+\s*$")
+
+
+# ---------------------------------------------------------------------------
+# HELPERS
+# ---------------------------------------------------------------------------
+
+def _is_noise(line: str) -> bool:
+    return bool(_NOISE_LINE_RE.search(line))
+
+
+def _is_excluded_heading(s: str) -> bool:
+    return bool(_SNI_EXCLUDE_RE.search(s))
+
+
+def _is_relevant_heading(s: str) -> bool:
+    return bool(_SNI_SECTION_RE.search(s))
+
+
+def _is_numbered_heading(s: str) -> bool:
+    return bool(_HEADING_RE.match(s))
+
+
+def _is_section_heading(s: str) -> bool:
+    """True for any line that acts as a section boundary (numbered or keyword-matched)."""
+    if _HEADING_RE.match(s):
+        return True
+    if _UNNUMBERED_KW_RE.match(s) and (
+        _SNI_EXCLUDE_RE.search(s) or _SNI_SECTION_RE.search(s)
+    ):
+        return True
+    return False
+
+
+def _extract_sni_id_from_headers(lines: list[str]) -> str | None:
+    """
+    Scan repeating page-header lines for the primary SNI identifier.
+    In BSN PDFs the SNI number (e.g. "SNI 4:2025") often appears as a
+    running header on every content page.  We pick the most-frequent
+    short SNI-like line as the canonical ID.
+    """
+    from collections import Counter
+    candidates = []
+    for ln in lines:
+        s = ln.strip()
+        if _SNI_HEADER_RE.match(s) and len(s) <= 30:
+            candidates.append(s)
+    if not candidates:
+        return None
+    # Most common short SNI header line = primary identifier
+    most_common, count = Counter(candidates).most_common(1)[0]
+    # Only trust it if it appears more than once (true running header)
+    return most_common if count > 1 else (most_common if candidates else None)
+
+
+def _extract_document_title(lines: list[str], sni_id: str | None) -> str | None:
+    """
+    Extract the document title (commodity/subject name) from the content area.
+    Strategy: look for the first non-boilerplate, non-SNI-id short line that
+    appears right after a page with the SNI id header, before section 1.
+    """
+    sni_id_norm = (sni_id or "").strip().lower()
+    # Collect candidate title lines — short, clean, not noise, not the SNI id itself
+    for ln in lines:
+        s = ln.strip()
+        if not s:
+            continue
+        if _is_noise(s) or _COVER_NOISE_RE.search(s):
+            continue
+        if _is_section_heading(s):
+            break
+        # Skip the SNI number line itself
+        if sni_id_norm and s.lower() == sni_id_norm:
+            continue
+        if _SNI_ID_LINE_RE.match(s):
+            continue
+        # Skip very long lines (copyright paragraphs etc.)
+        if len(s) > 120:
+            continue
+        # A plausible title: 3–80 chars, mostly letters
+        letter_ratio = sum(c.isalpha() for c in s) / max(len(s), 1)
+        if 3 <= len(s) <= 80 and letter_ratio >= 0.5:
+            return s
+    return None
+
+
+# ---------------------------------------------------------------------------
+# MAIN FILTER
+# ---------------------------------------------------------------------------
 
 def extract_sni_sections(raw_text: str) -> str:
     """
-    Filter raw text from an SNI PDF. Retains only:
-      1. Judul (title block before the first numbered section)
-      2. Nomor SNI (all SNI numbers found in text)
-      3. Ruang lingkup / Scope section content
-      4. Persyaratan / Mutu / Requirement / Quality section content
-      5. Any sentence containing: harus, shall, sebaiknya, should
-      6. Pengujian / Metode uji / Testing / Sampling /
-         Verifikasi / Validasi section content
+    Filter raw text extracted from an SNI PDF.
+
+    OUTPUT structure (plain text, no === markers):
+        <no_sni>: <judul>
+
+        <section heading>
+        <content lines>
+        ...
+
+    EXCLUDED:
+      • Cover page (everything before section 1, except title extraction)
+      • Copyright / ICS / BSN institutional lines (any page)
+      • Prakata / Foreword / Pendahuluan / Kata Pengantar
+      • Daftar Isi / Table of Contents
+      • Bibliografi / Daftar Pustaka / References
+      • Informasi Perumus / Komite Teknis / Panitia Teknis
+      • Footer noise (page numbers, BSN address, email, URL)
+
+    RETAINED:
+      • no_sni + judul header line
+      • Ruang Lingkup / Scope
+      • Acuan Normatif / Normative References
+      • Istilah dan Definisi / Terms and Definitions
+      • Persyaratan / Mutu / Spesifikasi / Requirement
+      • Pengujian / Metode Uji / Verifikasi / Validasi / Sampling
+      • Klasifikasi / Penandaan / Pengemasan / Keselamatan / Higiene
+      • Any sentence containing: harus / shall / sebaiknya / should
+        (even when inside an otherwise-excluded section)
     """
     lines = raw_text.splitlines()
 
-    # ── Pass 1: collect all SNI numbers ─────────────────────────────────────
-    sni_numbers = sorted(set(m.group().strip() for m in _SNI_NUMBER_RE.finditer(raw_text)))
+    # ── Step 1: extract SNI ID from running page headers ────────────────────
+    sni_id = _extract_sni_id_from_headers(lines)
 
-    # ── Pass 2: collect title lines (before first numbered section) ──────────
-    title_lines = []
+    # ── Step 2: find where content sections start (first numbered heading) ──
     first_section_idx = None
     for i, line in enumerate(lines):
         s = line.strip()
-        if not s:
-            continue
-        if re.match(r"^\d{1,2}[\. ]+\S", s):
+        if s and _is_numbered_heading(s):
             first_section_idx = i
             break
-        if len(title_lines) < 15:
-            title_lines.append(s)
 
-    # ── Pass 3: walk sections ─────────────────────────────────────────────────
-    kept_sections = []   # list of (section_label, [content_lines])
-    current_label = None
-    current_lines = []
+    # ── Step 3: extract document title from lines before section 1 ──────────
+    title_candidates = lines[:first_section_idx] if first_section_idx else lines[:60]
+    doc_title = _extract_document_title(title_candidates, sni_id)
+
+    # ── Step 4: walk numbered sections ──────────────────────────────────────
+    kept_sections: list[tuple[str, list[str]]] = []
+    current_label: str | None = None
+    current_lines: list[str] = []
     in_relevant = False
+    in_excluded = False
 
-    start_idx = first_section_idx if first_section_idx is not None else 0
-    for line in lines[start_idx:]:
+    start = first_section_idx if first_section_idx is not None else 0
+
+    for line in lines[start:]:
         s = line.strip()
-        if not s:
+
+        # Always drop noise lines
+        if not s or _is_noise(s):
             if in_relevant and current_lines:
                 current_lines.append("")
             continue
 
-        is_heading = bool(re.match(r"^\d{1,2}(?:\.\d+)*[\. ]+\S", s))
+        is_heading = _is_section_heading(s)
 
         if is_heading:
-            # Save previous section if it was relevant and has content
+            # Flush previous section
             if current_label is not None and in_relevant and current_lines:
-                kept_sections.append((current_label, list(current_lines)))
+                kept_sections.append((current_label, _clean_section_lines(current_lines)))
+
             current_label = s
             current_lines = []
-            in_relevant = bool(_SNI_SECTION_RE.search(s))
+
+            if _is_excluded_heading(s):
+                in_excluded = True
+                in_relevant = False
+            elif _is_relevant_heading(s):
+                in_excluded = False
+                in_relevant = True
+            else:
+                in_excluded = False
+                in_relevant = False
+
         else:
             if in_relevant:
+                # Skip lines that are just the SNI id repeated (running header)
+                if sni_id and s.lower() == sni_id.lower():
+                    continue
                 current_lines.append(s)
             elif _NORMATIVE_RE.search(s):
+                # Keep normative sentences regardless of section context
                 kept_sections.append(("[normative]", [s]))
 
-    # Don't forget last section
+    # Flush last section
     if current_label is not None and in_relevant and current_lines:
-        kept_sections.append((current_label, list(current_lines)))
+        kept_sections.append((current_label, _clean_section_lines(current_lines)))
 
-    # ── Assemble output ───────────────────────────────────────────────────────
-    parts = []
+    # ── Step 5: assemble output ──────────────────────────────────────────────
+    parts: list[str] = []
 
-    if sni_numbers:
-        parts.append("=== Nomor SNI ===")
-        parts.extend(sni_numbers)
-        parts.append("")
-
-    if title_lines:
-        parts.append("=== Judul ===")
-        parts.extend(title_lines)
+    # Header line: "no_sni: judul"
+    header_parts = []
+    if sni_id:
+        header_parts.append(sni_id)
+    if doc_title:
+        header_parts.append(doc_title)
+    if header_parts:
+        parts.append(": ".join(header_parts))
         parts.append("")
 
     for label, content_lines in kept_sections:
         if label != "[normative]":
-            parts.append(f"=== {label} ===")
-        content_lines_clean = [l for l in content_lines if l != ""]
-        parts.extend(content_lines_clean)
+            parts.append(label)
+        parts.extend(content_lines)
         parts.append("")
 
     return "\n".join(parts).strip()
+
+
+def _clean_section_lines(lines: list[str]) -> list[str]:
+    """Remove trailing blank lines and deduplicate adjacent blanks."""
+    out = []
+    prev_blank = False
+    for ln in lines:
+        if ln == "":
+            if not prev_blank:
+                out.append("")
+            prev_blank = True
+        else:
+            out.append(ln)
+            prev_blank = False
+    # strip leading/trailing blanks
+    while out and out[0] == "":
+        out.pop(0)
+    while out and out[-1] == "":
+        out.pop()
+    return out
 
 
 def _process_single_file(args) -> dict:

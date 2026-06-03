@@ -544,17 +544,34 @@ _SNI_SECTION_KEYWORDS = [
 # 2. SECTION KEYWORDS — headings (and their content) to EXCLUDE
 # ---------------------------------------------------------------------------
 _SNI_EXCLUDE_KEYWORDS = [
-    r"daftar\s+isi", r"table\s+of\s+contents?",
-    r"\bpendahuluan\b", r"\bforeword\b", r"\bprakata\b", r"\bintroduction\b",
+    # Daftar Isi / Table of Contents
+    r"daftar\s+isi", r"table\s+of\s+contents?", r"^contents?$",
+
+    # Prakata / Foreword / Kata Pengantar
+    r"\bprakata\b", r"\bforeword\b", r"kata\s+pengantar", r"kata\s+sambutan",
+    r"sambutan\s+(?:ketua|kepala|direktur)", r"\bpreface\b",
+
+    # Pendahuluan / Introduction
+    r"\bpendahuluan\b", r"\bintroduction\b",
+
+    # Bibliografi / Daftar Pustaka / References
     r"\bbibliografi\b", r"\bbibliography\b",
     r"daftar\s+pustaka", r"\breferensi\b", r"\breferences?\b",
+    r"daftar\s+acuan", r"sumber\s+pustaka",
+
+    # Informasi Perumus / Komite Teknis
     r"informasi\s+perumus", r"komite\s+teknis", r"drafting\s+committee",
     r"panitia\s+teknis", r"technical\s+committee",
     r"perumus(?:an)?\s+standar", r"penyusun(?:an)?\s+standar",
     r"keanggotaan\s+komite", r"committee\s+membership",
-    r"kata\s+pengantar",
+    r"susunan\s+keanggotaan", r"daftar\s+anggota\s+komite",
+
+    # Lampiran Informatif / Informative Annex
     r"lampiran\s+(?:informasi|informative[a-z]*)",
     r"annex\s+(?:informative[a-z]*|informasi)",
+
+    # Copyright / Hak Cipta
+    r"hak\s+cipta\b", r"\bcopyright\b", r"ketentuan\s+penggunaan",
 ]
 
 # ---------------------------------------------------------------------------
@@ -572,19 +589,24 @@ _NOISE_LINE_RE = re.compile(
     r"(?:"
     # copyright symbols and phrases
     r"©"
-    r"|hak\s+cipta\s+dilindungi"
+    r"|hak\s+cipta"
     r"|all\s+rights?\s+reserved"
     r"|dilarang\s+memperbanyak"
     r"|dilarang\s+mendistribusikan"
+    r"|dilarang\s+mereproduksi"
     r"|tanpa\s+izin\s+tertulis"
     r"|reproduction\s+prohibited"
+    r"|hak\s+penerbitan"
     # BSN institutional lines
     r"|badan\s+standardisasi\s+nasional"
     r"|standardisasi\s+nasional\s+indonesia"
     r"|dokinfo@bsn"
     r"|www\.bsn\.go\.id"
     r"|diterbitkan\s+di\s+jakarta"
+    r"|diterbitkan\s+oleh"
     r"|email\s*:"
+    r"|telp\s*[\.:]"
+    r"|fax\s*[\.:]"
     # ICS classification lines (e.g. "ICS 67.220.10")
     r"|^\s*ICS\s+\d"
     # Lone page numbers
@@ -602,10 +624,10 @@ _NOISE_LINE_RE = re.compile(
 # ---------------------------------------------------------------------------
 _COVER_NOISE_RE = re.compile(
     r"(?:"
-    r"standar\s+nasional\s+indonesia"      # cover banner
+    r"standar\s+nasional\s+indonesia"       # cover banner
     r"|national\s+standard\s+of\s+indonesia"
-    r"|^\s*ICS\b"                           # ICS line on cover
-    r"|^\s*SNI\s+\d[\w\.\-:]*\s*$"         # bare SNI number line (cover stamp)
+    r"|^\s*ICS\b"                            # ICS line on cover
+    r"|^\s*SNI\s+\d[\w\.\-:]*\s*$"          # bare SNI number line (cover stamp)
     r"|badan\s+standardisasi"
     r"|diterbitkan"
     r"|tanpa\s+izin"
@@ -617,6 +639,10 @@ _COVER_NOISE_RE = re.compile(
     r"|dokinfo"
     r"|www\.bsn"
     r"|email\s*:"
+    r"|hak\s+cipta"
+    r"|©"
+    r"|all\s+rights?\s+reserved"
+    r"|reproduction\s+prohibited"
     r")",
     re.IGNORECASE,
 )
@@ -644,8 +670,8 @@ _SNI_HEADER_RE = re.compile(
 # Heading: numbered section "1.", "2.1.", up to 55 chars after the number
 _HEADING_RE = re.compile(r"^\d{1,2}(?:\.\d+)*\.?\s+\S.{0,54}$")
 
-# Unnumbered heading: short pure-word line matching a known keyword
-_UNNUMBERED_KW_RE = re.compile(r"^[A-Za-z][A-Za-zÀ-ÿ\s]{2,50}$")
+# Unnumbered heading: short line (2–70 chars) — used for keyword-matched headings
+_UNNUMBERED_KW_RE = re.compile(r"^[\w][^\n]{1,68}$")
 
 # ToC entry pattern: line with trailing dots and/or page number
 _TOC_LINE_RE = re.compile(r"\.{3,}|\s{3,}\d+\s*$")
@@ -675,7 +701,8 @@ def _is_section_heading(s: str) -> bool:
     """True for any line that acts as a section boundary (numbered or keyword-matched)."""
     if _HEADING_RE.match(s):
         return True
-    if _UNNUMBERED_KW_RE.match(s) and (
+    # Any short line that matches exclude OR keep keyword list is a section boundary
+    if len(s) <= 70 and (
         _SNI_EXCLUDE_RE.search(s) or _SNI_SECTION_RE.search(s)
     ):
         return True
@@ -749,10 +776,11 @@ def extract_sni_sections(raw_text: str) -> str:
         <content lines>
         ...
 
-    EXCLUDED:
+    EXCLUDED (completely removed):
       • Cover page (everything before section 1, except title extraction)
       • Copyright / ICS / BSN institutional lines (any page)
-      • Prakata / Foreword / Pendahuluan / Kata Pengantar
+      • Prakata / Foreword / Kata Pengantar / Kata Sambutan
+      • Pendahuluan / Introduction
       • Daftar Isi / Table of Contents
       • Bibliografi / Daftar Pustaka / References
       • Informasi Perumus / Komite Teknis / Panitia Teknis
@@ -786,7 +814,7 @@ def extract_sni_sections(raw_text: str) -> str:
     title_candidates = lines[:first_section_idx] if first_section_idx else lines[:60]
     doc_title = _extract_document_title(title_candidates, sni_id)
 
-    # ── Step 4: walk numbered sections ──────────────────────────────────────
+    # ── Step 4: walk sections (start from section 1 or beginning) ───────────
     kept_sections: list[tuple[str, list[str]]] = []
     current_label: str | None = None
     current_lines: list[str] = []
@@ -798,10 +826,14 @@ def extract_sni_sections(raw_text: str) -> str:
     for line in lines[start:]:
         s = line.strip()
 
-        # Always drop noise lines
-        if not s or _is_noise(s):
+        # Always drop noise and cover-noise lines
+        if not s or _is_noise(s) or _COVER_NOISE_RE.search(s):
             if in_relevant and current_lines:
                 current_lines.append("")
+            continue
+
+        # Drop ToC-style entries (dotted leaders or trailing page numbers)
+        if _TOC_LINE_RE.search(s):
             continue
 
         is_heading = _is_section_heading(s)
@@ -830,8 +862,8 @@ def extract_sni_sections(raw_text: str) -> str:
                 if sni_id and s.lower() == sni_id.lower():
                     continue
                 current_lines.append(s)
-            elif _NORMATIVE_RE.search(s):
-                # Keep normative sentences regardless of section context
+            elif not in_excluded and _NORMATIVE_RE.search(s):
+                # Keep normative sentences only outside of excluded sections
                 kept_sections.append(("[normative]", [s]))
 
     # Flush last section

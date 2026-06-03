@@ -1,818 +1,1089 @@
+# engine.py
 """
-engine.py — SNI Core Extraction Engine (Improved v2)
-PDF/Word → accurate heuristic extraction → record matching sni_core.csv schema
-
-Kolom output (sesuai sni_core.csv):
-  no_sni        : Nomor SNI lengkap, mis. "SNI ISO/IEC 27007:2017"
-  judul         : Judul dokumen SNI dalam bahasa Indonesia
-  kategori      : Kategori bidang SNI (dari keyword mapping + ICS code)
-  ruang_lingkup : Isi seksi Scope / Ruang Lingkup (teks asli, maks ~600 char)
-  persyaratan   : Isi persyaratan/syarat mutu ("-" jika tidak ada)
-  metode_uji    : Referensi metode uji ("-" jika tidak ada)
-  keywords      : Kata kunci utama dari judul + topik dokumen
-
-Strategi ekstraksi:
-  1. Ekstrak teks PDF (PyMuPDF) atau DOCX (python-docx)
-  2. Parse no_sni dari halaman cover (baris "SNI ..." awal dokumen)
-  3. Judul: baris judul bahasa Indonesia dari cover (bukan bahasa Inggris)
-  4. Kategori: ICS code → mapping kategori; fallback keyword matching
-  5. Ruang lingkup: ekstrak seksi "Scope" / "Ruang Lingkup" / "1 Scope"
-  6. Persyaratan: ekstrak seksi syarat mutu/requirements (untuk SNI produk)
-  7. Metode uji: ekstrak referensi metode pengujian (untuk SNI produk)
-  8. Keywords: dari judul + topik utama dokumen
+DocAI Trainer - Engine
+Core processing logic: file extraction, chunking, merging, session management.
+Improvements:
+  - Support PDF, DOC, DOCX, JPG, PNG, JPEG, WEBP, GIF images (OCR)
+  - Up to 200 files, 200 MB per file
+  - Parallel processing with ThreadPoolExecutor
+  - Auto-paraphrase on process click (without API)
+  - Default paraphrase language = auto-detect
 """
 
-import re
+import os
 import json
-import logging
+import uuid
+import shutil
+import time
+import re
+import random
+import urllib.request
+import urllib.error
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from pathlib import Path
-from dataclasses import dataclass, asdict
+from typing import Optional
 
-log = logging.getLogger("sni_engine")
+# ──────────────────────────────────────────────────────────────────────────────
+# CONSTANTS
+# ──────────────────────────────────────────────────────────────────────────────
 
-# ─── Constants ────────────────────────────────────────────────────────────────
-MAX_SCOPE_CHARS = 600   # Ruang lingkup full, bukan potong 150
+UPLOADS_DIR = Path("uploads")
+UPLOADS_DIR.mkdir(exist_ok=True)
 
-# ICS code → kategori (prioritas pertama, paling akurat)
-ICS_KATEGORI: dict[str, str] = {
-    "67": "pangan",
-    "71": "kimia",
-    "91": "konstruksi",
-    "29": "elektro",
-    "27": "elektro",
-    "23": "mekanik",
-    "25": "mekanik",
-    "59": "tekstil",
-    "65": "pertanian",
-    "13": "lingkungan",
-    "11": "kesehatan",
-    "35": "teknologi informasi",
-    "43": "transportasi",
-    "45": "transportasi",
-    "03": "manajemen",
-    "01": "umum",
-    "07": "sains",
-    "17": "metrologi",
-    "19": "pengujian",
-    "21": "sistem mekanik",
-    "31": "elektronik",
-    "33": "telekomunikasi",
-    "37": "optik",
-    "39": "presisi",
-    "41": "tekstil",
-    "47": "perkapalan",
-    "49": "penerbangan",
-    "53": "material handling",
-    "55": "kemasan",
-    "57": "kertas",
-    "61": "industri tekstil",
-    "75": "minyak bumi",
-    "77": "metalurgi",
-    "79": "kayu",
-    "81": "keramik",
-    "83": "karet",
-    "85": "kertas cetak",
-    "87": "cat dan pelapis",
-    "93": "sipil",
-    "95": "pertahanan",
-    "97": "rumah tangga",
+ALLOWED_EXTENSIONS = {".pdf", ".doc", ".docx", ".txt", ".md", ".jpg", ".jpeg", ".png", ".webp", ".gif"}
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+MAX_FILE_SIZE_MB = 200
+MAX_FILES = 200
+
+# Indonesian synonyms for paraphrasing
+INDONESIAN_SYNONYMS = {
+    "menggunakan": ["memakai", "mengaplikasikan", "menerapkan"],
+    "membuat": ["menyusun", "merancang", "menghasilkan"],
+    "mendapatkan": ["memperoleh", "meraih", "menerima"],
+    "melakukan": ["menjalankan", "mengerjakan", "mengaplikasikan"],
+    "mempunyai": ["memiliki", "memperoleh", "mengandung"],
+    "menunjukkan": ["menampilkan", "memperlihatkan", "mengindikasikan"],
+    "menghasilkan": ["memproduksi", "menciptakan", "menyediakan"],
+    "mengurangi": ["meminimalkan", "menurunkan", "memperkecil"],
+    "meningkatkan": ["menambah", "memperbesar", "mengembangkan"],
+    "mengembangkan": ["memajukan", "memperluas", "meningkatkan"],
+    "penting": ["signifikan", "krusial", "esensial"],
+    "baik": ["bagus", "berkualitas", "memadai"],
+    "besar": ["luas", "signifikan", "substansial"],
+    "kecil": ["minimal", "sedikit", "terbatas"],
+    "cepat": ["sigap", "efisien", "responsif"],
+    "mudah": ["sederhana", "praktis", "tidak rumit"],
+    "sulit": ["kompleks", "menantang", "rumit"],
+    "juga": ["pun", "lagipula", "selain itu"],
+    "karena": ["sebab", "akibat", "lantaran"],
+    "tetapi": ["namun", "akan tetapi", "meskipun demikian"],
+    "dengan": ["melalui", "lewat", "menggunakan"],
+    "untuk": ["bagi", "kepada", "demi"],
+    "dari": ["asal", "berasal", "pangkal"],
+    "dalam": ["di", "pada", "ke dalam"],
+    "atau": ["maupun", "ataupun", "bahkan"],
+    "dan": ["serta", "dan juga", "lagi pula"],
 }
 
-# Keyword matching sebagai fallback
-CATEGORY_RULES: list[tuple[list[str], str]] = [
-    (["pangan", "makanan", "minuman", "gula", "garam", "minyak", "susu",
-      "daging", "ikan", "beras", "tepung", "kopi", "teh", "cokelat", "bumbu",
-      "saos", "kecap", "mie", "roti", "biskuit", "snack", "keju", "mentega",
-      "margarin", "es krim", "sirup", "jus", "sari buah", "halal", "pakan"], "pangan"),
-    (["kimia", "bahan kimia", "pestisida", "pupuk", "cat", "pelarut", "asam",
-      "basa", "reagen", "deterjen", "sabun", "kosmetik", "parfum", "pigmen",
-      "adhesif", "lem", "polimer", "plastik", "resin"], "kimia"),
-    (["konstruksi", "bangunan", "beton", "semen", "baja", "besi", "kayu",
-      "cat tembok", "keramik", "genteng", "bata", "pondasi", "aspal",
-      "agregat", "mortar", "panel", "plat", "pipa konstruksi", "struktur"], "konstruksi"),
-    (["elektro", "listrik", "elektronik", "kabel", "transformator", "motor",
-      "generator", "baterai", "saklar", "stop kontak", "lampu", "led",
-      "solar", "panel surya", "inverter", "ups", "charger", "tegangan"], "elektro"),
-    (["mekanik", "mesin", "pompa", "kompresor", "turbin", "roda gigi",
-      "bearing", "piston", "silinder", "katup", "flanges", "baut", "mur",
-      "valve", "pressure"], "mekanik"),
-    (["tekstil", "kain", "benang", "serat", "rajut", "tenun", "pakaian",
-      "garmen", "karpet", "nonwoven"], "tekstil"),
-    (["pertanian", "agro", "bibit", "benih", "tanah", "irigasi", "traktor",
-      "hortikultura", "perkebunan", "kehutanan", "perikanan"], "pertanian"),
-    (["lingkungan", "air bersih", "air minum", "air limbah", "udara", "emisi",
-      "polutan", "baku mutu lingkungan", "amdal", "limbah", "pencemaran"], "lingkungan"),
-    (["kesehatan", "medis", "alat kesehatan", "farmasi", "obat", "sterilisasi",
-      "masker", "sarung tangan medis", "jarum", "syringe", "laboratorium klinik",
-      "diagnostik"], "kesehatan"),
-    (["informatika", "teknologi informasi", "perangkat lunak", "software",
-      "hardware", "jaringan", "keamanan informasi", "keamanan siber",
-      "enkripsi", "iso 27", "isms", "iec 27", "manajemen keamanan"], "teknologi informasi"),
-    (["transportasi", "kendaraan", "otomotif", "sepeda motor", "ban", "helm",
-      "sabuk pengaman", "kapal", "pesawat", "kereta", "automotive"], "transportasi"),
-    (["manajemen", "sistem manajemen", "audit", "sertifikasi", "akreditasi",
-      "mutu", "kualitas", "iso 9", "iso 14", "iso 45", "ohsas"], "manajemen"),
-]
+ENGLISH_SYNONYMS = {
+    "use": ["utilize", "employ", "apply"],
+    "make": ["create", "construct", "build"],
+    "get": ["obtain", "acquire", "receive"],
+    "do": ["perform", "execute", "conduct"],
+    "have": ["possess", "contain", "hold"],
+    "show": ["display", "demonstrate", "indicate"],
+    "produce": ["generate", "create", "yield"],
+    "reduce": ["minimize", "decrease", "lessen"],
+    "increase": ["enhance", "boost", "improve"],
+    "develop": ["advance", "expand", "grow"],
+    "important": ["significant", "crucial", "essential"],
+    "good": ["excellent", "quality", "adequate"],
+    "big": ["large", "substantial", "significant"],
+    "small": ["minimal", "limited", "minor"],
+    "fast": ["quick", "rapid", "efficient"],
+    "easy": ["simple", "straightforward", "uncomplicated"],
+    "difficult": ["complex", "challenging", "hard"],
+    "also": ["additionally", "furthermore", "moreover"],
+    "because": ["since", "as", "due to"],
+    "but": ["however", "nevertheless", "yet"],
+    "with": ["using", "through", "by means of"],
+    "for": ["to", "in order to", "intended for"],
+    "from": ["originating", "derived", "starting"],
+    "in": ["within", "inside", "during"],
+    "or": ["alternatively", "otherwise", "or else"],
+    "and": ["as well as", "along with", "plus"],
+}
 
-# Pattern SNI number
-# Contoh: SNI ISO/IEC 27007:2017, SNI 01-3141-1998, SNI 3564:2009
-SNI_FULL_PATTERN = re.compile(
-    r'SNI\s+(?:ISO(?:/IEC)?(?:\s*/\s*IEC)?\s+[\d]+(?:[:/]\w+)*(?::\d{4})?'
-    r'|IEC\s+[\d]+(?:[:/]\w+)*(?::\d{4})?'
-    r'|\d{2}[\-\.]\d{3,5}[\-\.]\d{4}'
-    r'|\d{4,6}(?:[\-:]\d+)*(?::\d{4})?)',
-    re.IGNORECASE
-)
+# ──────────────────────────────────────────────────────────────────────────────
+# UTILITY
+# ──────────────────────────────────────────────────────────────────────────────
 
-# Pattern angka:tahun untuk versi/tahun dokumen
-YEAR_PATTERN = re.compile(r':(\d{4})\b')
-
-# Pattern ICS code di cover
-ICS_PATTERN = re.compile(r'\bICS\s+(\d{2})\.(\d{3})', re.IGNORECASE)
-
-# Referensi SNI lain dalam teks (untuk metode_uji)
-SNI_REF_IN_TEXT = re.compile(
-    r'SNI\s+(?:ISO(?:/IEC)?\s+)?(\d[\d\s\-\.:\/A-Z]+(?::\d{4})?)',
-    re.IGNORECASE
-)
-
-# ─── Data model ───────────────────────────────────────────────────────────────
-@dataclass
-class SNIRecord:
-    no_sni:        str = ""
-    judul:         str = ""
-    kategori:      str = ""
-    ruang_lingkup: str = ""
-    persyaratan:   str = "-"
-    metode_uji:    str = "-"
-    keywords:      str = ""
-
-    def to_jsonl(self) -> str:
-        return json.dumps(asdict(self), ensure_ascii=False)
+def format_size(byte_count: int) -> str:
+    if byte_count == 0:
+        return "0 B"
+    units = ["B", "KB", "MB", "GB"]
+    i = 0
+    val = float(byte_count)
+    while val >= 1024 and i < len(units) - 1:
+        val /= 1024
+        i += 1
+    return f"{val:.2f} {units[i]}"
 
 
-# ─── Text extraction ──────────────────────────────────────────────────────────
-def extract_pdf(path: Path) -> tuple[str, str]:
-    """
-    Ekstrak teks PDF dengan PyMuPDF.
-    Return: (full_text, cover_text)
-    cover_text = halaman 1 saja untuk parsing no_sni & judul
-    """
-    try:
-        import fitz
-        doc = fitz.open(str(path))
-        pages = []
-        total = 0
-        for i, page in enumerate(doc):
-            t = page.get_text("text")
-            pages.append(t)
-            total += len(t)
-            if total > 60_000:
-                break
-        doc.close()
-        cover = pages[0] if pages else ""
-        full  = "\n".join(pages)
-        return full, cover
-    except Exception as e:
-        log.debug(f"PyMuPDF failed {path.name}: {e}, trying fallback")
-        return _extract_pdf_fallback(path)
+def generate_session_id() -> str:
+    return f"sess_{int(time.time() * 1000)}_{uuid.uuid4().hex[:9]}"
 
 
-def _extract_pdf_fallback(path: Path) -> tuple[str, str]:
-    try:
-        from pypdf import PdfReader
-        r = PdfReader(str(path))
-        pages = []
-        for page in r.pages[:60]:
-            pages.append(page.extract_text() or "")
-        cover = pages[0] if pages else ""
-        return "\n".join(pages), cover
-    except Exception as e:
-        log.warning(f"PDF fallback failed {path.name}: {e}")
-        return "", ""
+def ensure_dir(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
-def extract_docx(path: Path) -> tuple[str, str]:
-    try:
-        from docx import Document
-        doc = Document(str(path))
-        parts = []
-        for p in doc.paragraphs:
-            if p.text.strip():
-                parts.append(p.text)
-        for table in doc.tables:
-            for row in table.rows:
-                row_cells = [c.text.strip() for c in row.cells if c.text.strip()]
-                if row_cells:
-                    parts.append(" | ".join(row_cells))
-        full  = "\n".join(parts)
-        cover = "\n".join(parts[:40])  # ~40 paragraf pertama sebagai cover
-        return full, cover
-    except Exception as e:
-        log.warning(f"DOCX failed {path.name}: {e}")
-        return "", ""
+# ──────────────────────────────────────────────────────────────────────────────
+# SESSION MANAGEMENT
+# ──────────────────────────────────────────────────────────────────────────────
+
+def get_session_dir(session_id: str) -> Path:
+    return UPLOADS_DIR / session_id
 
 
-def extract_text(path: Path) -> tuple[str, str]:
-    """Return (full_text, cover_text)"""
-    ext = path.suffix.lower()
-    if ext == ".pdf":
-        return extract_pdf(path)
-    elif ext in (".docx", ".doc"):
-        return extract_docx(path)
-    return "", ""
+def init_session(session_id: str) -> dict:
+    d = get_session_dir(session_id)
+    ensure_dir(d / "original")
+    ensure_dir(d / "processed")
+    ensure_dir(d / "chunks")
+    return {"session_id": session_id, "path": str(d)}
 
 
-# ─── Parser: no_sni ───────────────────────────────────────────────────────────
-def parse_no_sni(cover: str, full: str, filename: str) -> str:
-    """
-    Ekstrak nomor SNI lengkap dari cover halaman.
-    
-    Pola yang dicari (prioritas):
-      1. "SNI ISO/IEC XXXXX:YYYY" - standar internasional diadopsi
-      2. "SNI ISO XXXXX:YYYY"
-      3. "SNI XXXX:YYYY" atau "SNI XX-XXXX-YYYY"
-    
-    Juga tangkap tahun penetapan BSN dari "(Ditetapkan oleh BSN tahun YYYY)"
-    untuk memastikan formatnya benar.
-    """
-    # Cari di 15 baris pertama cover (biasanya ada di halaman 1)
-    cover_lines = [l.strip() for l in cover.splitlines() if l.strip()]
-    
-    # Scan baris-baris cover untuk menemukan nomor SNI
-    for line in cover_lines[:30]:
-        # Skip baris ICS
-        if line.startswith("ICS"):
+def list_sessions() -> list:
+    sessions = []
+    if not UPLOADS_DIR.exists():
+        return sessions
+    for entry in UPLOADS_DIR.iterdir():
+        if not entry.is_dir():
             continue
-        # Cari pola "SNI ..." di baris
-        m = SNI_FULL_PATTERN.match(line)
-        if m:
-            no = m.group(0).strip()
-            # Normalisasi spasi
-            no = re.sub(r'\s+', ' ', no)
-            return no
-        # Cari pola di dalam baris (misal ada teks lain di depan)
-        m = SNI_FULL_PATTERN.search(line)
-        if m and len(line) < 60:  # Baris pendek = kemungkinan baris nomor SNI
-            no = m.group(0).strip()
-            no = re.sub(r'\s+', ' ', no)
-            return no
+        stat = entry.stat()
+        size = _calc_dir_size(entry)
+        file_count = sum(1 for f in entry.rglob("*") if f.is_file())
+        meta_path = entry / "metadata.json"
+        metadata = None
+        if meta_path.exists():
+            try:
+                metadata = json.loads(meta_path.read_text("utf-8"))
+            except Exception:
+                pass
+        sessions.append({
+            "id": entry.name,
+            "created_at": datetime.fromtimestamp(stat.st_ctime).strftime("%Y-%m-%d %H:%M"),
+            "modified_at": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
+            "modified_ts": stat.st_mtime,
+            "file_size": size,
+            "file_size_fmt": format_size(size),
+            "file_count": file_count,
+            "metadata": metadata,
+        })
+    sessions.sort(key=lambda x: x["modified_ts"], reverse=True)
+    return sessions
 
-    # Fallback: cari di 200 karakter pertama full text
-    head = full[:500]
-    m = SNI_FULL_PATTERN.search(head)
-    if m:
-        no = m.group(0).strip()
-        return re.sub(r'\s+', ' ', no)
 
-    # Fallback: dari filename
-    # Mis: SNI_ISO-IEC_27007_2017.pdf → SNI ISO/IEC 27007:2017
-    fname = Path(filename).stem
-    fname_clean = fname.replace('_', ' ').replace('-', ' ')
-    # Cari pola XX-XXXX-YYYY di filename
-    m2 = re.search(r'(\d{2})\s+(\d{3,5})\s+(\d{4})', fname_clean)
-    if m2:
-        return f"SNI {m2.group(1)}-{m2.group(2)}-{m2.group(3)}"
-    # Cari ISO IEC di filename
-    m3 = re.search(r'(ISO[\s\-/]*(?:IEC[\s\-/]*)?\s*\d+[\s\-:]*\d{0,4})', fname_clean, re.IGNORECASE)
-    if m3:
-        iso_part = re.sub(r'\s+', ' ', m3.group(1).strip())
-        return f"SNI {iso_part}"
+def get_session_detail(session_id: str) -> Optional[dict]:
+    session_path = get_session_dir(session_id)
+    if not session_path.exists():
+        return None
+    structure = {}
+    for subdir in ["original", "processed", "chunks"]:
+        sub = session_path / subdir
+        if sub.exists():
+            structure[subdir] = [
+                {
+                    "name": f.name,
+                    "size": f.stat().st_size,
+                    "size_fmt": format_size(f.stat().st_size),
+                    "modified": datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
+                }
+                for f in sub.iterdir()
+                if f.is_file()
+            ]
+    meta_path = session_path / "metadata.json"
+    metadata = json.loads(meta_path.read_text("utf-8")) if meta_path.exists() else None
+    return {"session_id": session_id, "metadata": metadata, "structure": structure}
+
+
+def delete_session(session_id: str) -> dict:
+    session_path = get_session_dir(session_id)
+    if not session_path.exists():
+        return {"success": False, "error": "Session not found"}
+    size = _calc_dir_size(session_path)
+    shutil.rmtree(session_path)
+    return {"success": True, "freed_bytes": size, "freed_fmt": format_size(size)}
+
+
+def cleanup_old_sessions(max_age_hours: int = 24, exclude_id: str = "") -> dict:
+    max_age_ms = max_age_hours * 3600 * 1000
+    now = time.time() * 1000
+    deleted, freed = 0, 0
+    if not UPLOADS_DIR.exists():
+        return {"deleted": 0, "freed_bytes": 0, "freed_fmt": "0 B"}
+    for entry in UPLOADS_DIR.iterdir():
+        if not entry.is_dir():
+            continue
+        if entry.name == exclude_id:
+            continue
+        age_ms = now - entry.stat().st_mtime * 1000
+        if age_ms > max_age_ms:
+            size = _calc_dir_size(entry)
+            shutil.rmtree(entry)
+            freed += size
+            deleted += 1
+    return {"deleted": deleted, "freed_bytes": freed, "freed_fmt": format_size(freed)}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Hapus SEMUA session (kecuali session aktif)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def delete_all_sessions(exclude_id: str = "") -> dict:
+    """
+    Delete ALL sessions from disk, except the one matching exclude_id.
+    Returns count of deleted sessions and total freed bytes.
+    """
+    deleted, freed = 0, 0
+    if not UPLOADS_DIR.exists():
+        return {"deleted": 0, "freed_bytes": 0, "freed_fmt": "0 B"}
+    for entry in list(UPLOADS_DIR.iterdir()):
+        if not entry.is_dir():
+            continue
+        if entry.name == exclude_id:
+            continue
+        size = _calc_dir_size(entry)
+        shutil.rmtree(entry)
+        freed += size
+        deleted += 1
+    return {"deleted": deleted, "freed_bytes": freed, "freed_fmt": format_size(freed)}
+
+
+def _calc_dir_size(path: Path) -> int:
+    return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FILE SAVING
+# ──────────────────────────────────────────────────────────────────────────────
+
+def save_uploaded_file(session_id: str, uploaded_file) -> dict:
+    """Save a Streamlit UploadedFile to disk. Returns file info dict."""
+    session_dir = get_session_dir(session_id)
+    original_dir = ensure_dir(session_dir / "original")
+
+    safe_name = re.sub(r"[^a-zA-Z0-9._\-]", "_", uploaded_file.name)
+    unique_name = f"{int(time.time() * 1000)}_{safe_name}"
+    dest = original_dir / unique_name
+
+    content = uploaded_file.read()
+    dest.write_bytes(content)
+
+    return {
+        "original_name": uploaded_file.name,
+        "saved_name": unique_name,
+        "path": str(dest),
+        "size": len(content),
+        "size_fmt": format_size(len(content)),
+        "ext": Path(uploaded_file.name).suffix.lower(),
+        "session_id": session_id,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TEXT EXTRACTION  (PDF, DOC, DOCX, TXT, MD, Images)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def extract_text_from_file(file_path: str, file_ext: str) -> str:
+    """Extract raw text from PDF / DOC / DOCX / TXT / MD / image files."""
+    p = Path(file_path)
+    ext = file_ext.lower()
+
+    # ── Plain text ──
+    if ext in (".txt", ".md"):
+        for enc in ("utf-8", "latin-1", "cp1252"):
+            try:
+                return p.read_text(enc)
+            except UnicodeDecodeError:
+                continue
+        return p.read_bytes().decode("utf-8", errors="replace")
+
+    # ── PDF ──
+    elif ext == ".pdf":
+        try:
+            import pypdf
+            reader = pypdf.PdfReader(str(p))
+            pages = []
+            for page in reader.pages:
+                text = page.extract_text()
+                if text:
+                    pages.append(text)
+            extracted = "\n\n".join(pages)
+            if len(extracted.strip()) >= 50:
+                return extracted
+        except ImportError:
+            pass
+        return _extract_pdf_fallback(p)
+
+    # ── DOCX ──
+    elif ext == ".docx":
+        try:
+            import docx as python_docx
+            doc = python_docx.Document(str(p))
+            parts = [para.text for para in doc.paragraphs if para.text.strip()]
+            for table in doc.tables:
+                for row in table.rows:
+                    for cell in row.cells:
+                        if cell.text.strip():
+                            parts.append(cell.text.strip())
+            return "\n\n".join(parts)
+        except ImportError:
+            return _extract_docx_fallback(p)
+
+    # ── DOC (legacy) ──
+    elif ext == ".doc":
+        return _extract_doc_legacy(p)
+
+    # ── Excel XLSX ──
+    elif ext == ".xlsx":
+        return _extract_excel_text(p, engine="openpyxl")
+
+    # ── Excel XLS (legacy) ──
+    elif ext == ".xls":
+        return _extract_excel_text(p, engine="xlrd")
+
+    # ── Images (OCR) ──
+    elif ext in IMAGE_EXTENSIONS:
+        return _extract_image_text(p)
 
     return ""
 
 
-# ─── Parser: judul ────────────────────────────────────────────────────────────
-def _join_wrapped_lines(lines: list[str]) -> list[str]:
-    """Gabungkan baris lanjutan (PDF sering wrap judul panjang ke baris berikutnya).
-    
-    Aturan penggabungan:
-    - Baris dimulai huruf kecil → lanjutan dari baris sebelumnya
-    - Baris sebelumnya pendek (<65 char) dan tidak diakhiri tanda baca → lanjutan
-    - TIDAK gabungkan jika: baris dimulai "(", angka, atau huruf kapital semua
-    """
-    result = []
-    for line in lines:
-        if not line:
-            result.append("")
-            continue
-        if result and result[-1]:
-            prev = result[-1]
-            # Jangan gabungkan jika baris baru dimulai dengan karakter khusus
-            starts_paren   = line[0] == "("
-            starts_digit   = line[0].isdigit()
-            starts_special = line[0] in "©@#"
-            starts_lower   = line[0].islower()
-            prev_short     = len(prev) < 65 and prev[-1] not in ".!?:;"
-            # Hanya gabungkan jika dimulai huruf kecil ATAU baris sblm pendek
-            # dan tidak ada kondisi pengecualian
-            if (starts_lower or prev_short) and not (starts_paren or starts_digit or starts_special):
-                result[-1] = prev + " " + line
-                continue
-        result.append(line)
-    return result
+def _extract_pdf_fallback(p: Path) -> str:
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["pdftotext", str(p), "-"],
+            capture_output=True, text=True, timeout=120
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout
+    except Exception:
+        pass
+    return f"[Cannot extract PDF: {p.name}. Install pypdf or pdftotext]"
 
 
-def parse_judul(cover: str, full: str, filename: str) -> str:
-    """
-    Ekstrak judul dokumen SNI (bahasa Indonesia).
-    Menggabungkan baris lanjutan akibat PDF line-wrap.
-    """
-    raw_lines = [l.strip() for l in cover.splitlines() if l.strip()]
-    cover_lines = _join_wrapped_lines(raw_lines)
-    
-    # Temukan posisi nomor SNI di cover_lines
-    sni_line_idx = -1
-    for i, line in enumerate(cover_lines[:20]):
-        if SNI_FULL_PATTERN.match(line) or (
-            re.search(r'^SNI\s+', line, re.IGNORECASE) and len(line) < 60
-        ):
-            sni_line_idx = i
-            break
-
-    # Kumpulkan kandidat judul:
-    # - Baris setelah nomor SNI
-    # - Baris yang bukan nomor/copyright/ICS
-    # - Bukan dalam bahasa Inggris murni (jika ada bahasa Indonesia)
-    candidates = []
-    
-    # Baris setelah nomor SNI hingga batas cover
-    search_start = max(0, sni_line_idx + 1) if sni_line_idx >= 0 else 0
-    
-    for line in cover_lines[search_start:search_start + 15]:
-        # Skip baris tidak relevan
-        if not line or len(line) < 8:
-            continue
-        if line.startswith("ICS"):
-            continue
-        if re.match(r'^©', line):
-            continue
-        if re.match(r'^\(', line) and 'IDT' in line:
-            continue  # Skip "(ISO/IEC ..., IDT, Eng)"
-        if re.match(r'^Badan Standardisasi', line, re.IGNORECASE):
-            continue
-        if re.match(r'^Standar Nasional', line, re.IGNORECASE):
-            continue
-        if re.match(r'^\(Ditetapkan', line, re.IGNORECASE):
-            continue
-        if re.match(r'^\(ISO', line, re.IGNORECASE):
-            continue  # Skip "(ISO/IEC ..., IDT, Eng)"
-        if re.match(r'^\(IEC', line, re.IGNORECASE):
-            continue
-        # Skip jika ini nomor SNI itu sendiri
-        if SNI_FULL_PATTERN.match(line):
-            continue
-        # Harus ada huruf, bukan hanya angka
-        if not re.search(r'[a-zA-Z]{3,}', line):
-            continue
-        # Panjang wajar untuk judul
-        if 8 <= len(line) <= 200:
-            candidates.append(line)
-
-    if not candidates:
-        # Fallback: semua baris non-trivial di cover
-        for line in cover_lines[:25]:
-            if (8 <= len(line) <= 200 and
-                re.search(r'[a-zA-Z]{3,}', line) and
-                not line.startswith("ICS") and
-                not line.startswith("©") and
-                not SNI_FULL_PATTERN.match(line)):
-                candidates.append(line)
-
-    if not candidates:
-        # Fallback akhir: dari filename
-        return Path(filename).stem.replace('_', ' ').replace('-', ' ').title()
-
-    # Pilih judul terbaik:
-    # Prioritaskan bahasa Indonesia (ada kata khas Indonesia)
-    id_keywords = re.compile(
-        r'\b(dan|atau|untuk|dari|dengan|yang|dalam|tentang|teknik|pedoman|'
-        r'persyaratan|spesifikasi|metode|cara|sistem|manajemen|pengujian|'
-        r'informasi|keamanan|teknologi|standar|nasional|prinsip|panduan)\b',
-        re.IGNORECASE
-    )
-    
-    # Gabungkan baris yang bisa jadi judul multi-baris (jika pendek-pendek)
-    # Mis: "Teknologi informasi - Teknik keamanan - Pedoman\naudit sistem..."
-    judul_lines = []
-    for c in candidates[:6]:
-        if id_keywords.search(c):
-            judul_lines.append(c)
-        elif not judul_lines and re.search(r'[A-Z]', c):
-            # Ambil juga jika belum ada kandidat bahasa Indonesia
-            judul_lines.append(c)
-
-    if not judul_lines:
-        judul_lines = candidates[:2]
-
-    # Gabungkan baris-baris yang merupakan sambungan judul
-    # Deteksi baris lanjutan: baris yang tidak dimulai huruf kapital besar
-    # dan tidak ada tanda pemisah topik di baris sebelumnya
-    result = []
-    for i, line in enumerate(judul_lines[:4]):
-        if i == 0:
-            result.append(line)
-        else:
-            # Gabungkan jika baris sebelumnya terlihat belum selesai
-            # (tidak diakhiri tanda baca, atau dimulai huruf kecil)
-            prev = result[-1] if result else ""
-            starts_lower = line and line[0].islower()
-            prev_incomplete = prev and not prev.endswith(('.', '!', '?', '"'))
-            if starts_lower or prev_incomplete:
-                result[-1] = result[-1].rstrip() + " " + line
-            else:
-                result.append(line)
-            # Hentikan jika sudah cukup panjang
-            if len(" ".join(result)) > 50:
-                break
-
-    judul = " ".join(result).strip()
-    # Bersihkan prefix "(Ditetapkan...)" atau "(ISO/IEC...)" yang terbawa
-    judul = re.sub(r'^\([^)]{0,60}\)\s*', '', judul).strip()
-    # Bersihkan suffix "(ISO/IEC...)"
-    judul = re.sub(r'\s*\(ISO[^)]*\)\s*$', '', judul, flags=re.IGNORECASE).strip()
-    judul = re.sub(r'\s+', ' ', judul)
-
-    return judul if judul else candidates[0]
+def _extract_docx_fallback(p: Path) -> str:
+    try:
+        import zipfile
+        import xml.etree.ElementTree as ET
+        texts = []
+        with zipfile.ZipFile(str(p)) as z:
+            with z.open("word/document.xml") as f:
+                tree = ET.parse(f)
+                ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+                for t in tree.findall(".//w:t", ns):
+                    if t.text:
+                        texts.append(t.text)
+        return " ".join(texts)
+    except Exception:
+        return f"[Cannot extract DOCX: {p.name}. Install python-docx]"
 
 
-# ─── Parser: kategori ─────────────────────────────────────────────────────────
-def parse_kategori(cover: str, full: str) -> str:
-    """
-    Kategori dari ICS code (paling akurat) lalu fallback keyword.
-    ICS code contoh: "ICS 35.030" → prefix "35" → Informatika
-    """
-    # Cari ICS code di cover
-    m = ICS_PATTERN.search(cover)
-    if m:
-        ics_prefix = m.group(1)
-        if ics_prefix in ICS_KATEGORI:
-            return ICS_KATEGORI[ics_prefix]
-
-    # Fallback: keyword matching di 3000 char pertama
-    text_low = (cover + "\n" + full[:2000]).lower()
-    for keywords, cat in CATEGORY_RULES:
-        for kw in keywords:
-            if kw in text_low:
-                return cat
-
-    return "umum"
-
-
-# ─── Utility: find section ────────────────────────────────────────────────────
-def _find_section_text(text: str, start_patterns: list[str],
-                       end_patterns: list[str], max_chars: int = 2000) -> str:
-    """
-    Cari teks antara header section dan header section berikutnya.
-    start_patterns: list regex pattern untuk header mulai
-    end_patterns: list regex pattern untuk header akhir
-    """
-    text_lines = text.splitlines()
-    start_idx = -1
-    
-    for pat in start_patterns:
-        for i, line in enumerate(text_lines):
-            if re.search(pat, line, re.IGNORECASE):
-                start_idx = i + 1
-                break
-        if start_idx >= 0:
-            break
-
-    if start_idx < 0:
-        return ""
-
-    # Cari akhir section
-    end_idx = len(text_lines)
-    for pat in end_patterns:
-        for i, line in enumerate(text_lines[start_idx:], start=start_idx):
-            if re.search(pat, line, re.IGNORECASE):
-                end_idx = i
-                break
-        if end_idx < len(text_lines):
-            break
-
-    section_lines = text_lines[start_idx:end_idx]
-    section_text = "\n".join(section_lines).strip()
-    return section_text[:max_chars]
-
-
-# ─── Parser: ruang_lingkup ────────────────────────────────────────────────────
-def parse_ruang_lingkup(full: str) -> str:
-    """
-    Ekstrak isi Scope / Ruang Lingkup.
-    
-    Untuk SNI adopsi internasional (bahasa Inggris): ambil teks aslinya.
-    Untuk SNI lokal (bahasa Indonesia): ambil teks bahasa Indonesia.
-    
-    Cari seksi:
-    - "1 Scope" / "1. Scope" / "Scope"
-    - "Ruang lingkup" / "1 Ruang lingkup"
-    """
-    SCOPE_START = [
-        r'^\s*1[\.\s]+\s*Scope\s*$',
-        r'^\s*1[\.\s]+\s*Ruang\s+lingkup\s*$',
-        r'^\s*Scope\s*$',
-        r'^\s*Ruang\s+lingkup\s*$',
-        r'^\s*1\s+Scope',
-        r'^\s*1\s+Ruang',
-    ]
-    SCOPE_END = [
-        r'^\s*2[\.\s]',
-        r'^\s*Normative',
-        r'^\s*Acuan\s+normatif',
-        r'^\s*Terms\s+and\s+definitions',
-        r'^\s*Istilah\s+dan\s+definisi',
-    ]
-
-    section = _find_section_text(full, SCOPE_START, SCOPE_END, max_chars=MAX_SCOPE_CHARS)
-    
-    if not section:
-        return ""
-    
-    # Bersihkan: hapus header halaman, copyright, baris kosong berlebih
-    lines = []
-    for line in section.splitlines():
-        line = line.strip()
-        if not line:
-            if lines and lines[-1]:  # Satu baris kosong saja
-                lines.append("")
-            continue
-        # Skip header halaman (mis: "SNI ISO/IEC 27007:2017")
-        if SNI_FULL_PATTERN.match(line):
-            continue
-        # Skip "© BSN XXXX"
-        if re.match(r'^©', line):
-            continue
-        # Skip baris nomor halaman "1 dari 43"
-        if re.match(r'^\d+\s+dari\s+\d+$', line, re.IGNORECASE):
-            continue
-        lines.append(line)
-    
-    # Gabungkan dan bersihkan spasi berlebih
-    result = re.sub(r'\n{3,}', '\n\n', "\n".join(lines)).strip()
-    return result[:MAX_SCOPE_CHARS]
-
-
-# ─── Parser: persyaratan ──────────────────────────────────────────────────────
-def parse_persyaratan(full: str) -> str:
-    """
-    Ekstrak persyaratan mutu / syarat teknis.
-    
-    Relevan untuk SNI produk (pangan, kimia, dll).
-    Untuk SNI sistem manajemen / panduan, biasanya kosong ("-").
-    
-    Cari seksi:
-    - "Syarat mutu" / "Persyaratan mutu" / "Persyaratan teknis"
-    - "Requirements" / "Karakteristik"
-    
-    Kembalikan teks persyaratan (bukan hanya parameter),
-    atau "-" jika tidak ada.
-    """
-    SYARAT_START = [
-        r'^\s*\d+[\.\s]+\s*Syarat\s+mutu',
-        r'^\s*\d+[\.\s]+\s*Persyaratan\s+mutu',
-        r'^\s*\d+[\.\s]+\s*Persyaratan\s+teknis',
-        r'^\s*\d+[\.\s]+\s*Ketentuan\s+mutu',
-        r'^\s*\d+[\.\s]+\s*Karakteristik',
-        r'^\s*\d+[\.\s]+\s*Spesifikasi\s+teknis',
-        r'^\s*\d+[\.\s]+\s*Requirements',
-        r'^\s*Syarat\s+mutu',
-        r'^\s*Persyaratan\s+mutu',
-    ]
-    SYARAT_END = [
-        r'^\s*\d+[\.\s]+\s*Metode\s+uji',
-        r'^\s*\d+[\.\s]+\s*Cara\s+uji',
-        r'^\s*\d+[\.\s]+\s*Pengujian',
-        r'^\s*\d+[\.\s]+\s*Pengambilan\s+contoh',
-        r'^\s*\d+[\.\s]+\s*Pengemasan',
-        r'^\s*\d+[\.\s]+\s*Penandaan',
-        r'^\s*\d+[\.\s]+\s*Marking',
-        r'^\s*\d+[\.\s]+\s*Sampling',
-    ]
-
-    section = _find_section_text(full, SYARAT_START, SYARAT_END, max_chars=800)
-
-    if not section or len(section.strip()) < 10:
-        return "-"
-
-    # Bersihkan teks
-    lines = []
-    for line in section.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        if SNI_FULL_PATTERN.match(line):
-            continue
-        if re.match(r'^©', line):
-            continue
-        if re.match(r'^\d+\s+dari\s+\d+$', line, re.IGNORECASE):
-            continue
-        lines.append(line)
-
-    result = " ".join(lines).strip()
-    result = re.sub(r'\s+', ' ', result)
-    return result[:600] if result else "-"
-
-
-# ─── Parser: metode_uji ───────────────────────────────────────────────────────
-def parse_metode_uji(full: str) -> str:
-    """
-    Ekstrak referensi metode uji.
-    
-    Untuk SNI produk: cari seksi "Metode uji" / "Cara uji"
-    dan referensi SNI yang dikutip di sana.
-    
-    Untuk SNI sistem manajemen / panduan: biasanya "-".
-    """
-    METODE_START = [
-        r'^\s*\d+[\.\s]+\s*Metode\s+uji',
-        r'^\s*\d+[\.\s]+\s*Cara\s+uji',
-        r'^\s*\d+[\.\s]+\s*Metoda\s+uji',
-        r'^\s*\d+[\.\s]+\s*Pengujian',
-        r'^\s*\d+[\.\s]+\s*Test\s+methods',
-        r'^\s*Metode\s+uji',
-        r'^\s*Cara\s+uji',
-    ]
-    METODE_END = [
-        r'^\s*\d+[\.\s]+\s*Pengambilan\s+contoh',
-        r'^\s*\d+[\.\s]+\s*Pengemasan',
-        r'^\s*\d+[\.\s]+\s*Penandaan',
-        r'^\s*\d+[\.\s]+\s*Sampling',
-        r'^\s*\d+[\.\s]+\s*Marking',
-        r'^\s*Lampiran',
-        r'^\s*Annex',
-        r'^\s*Bibliography',
-        r'^\s*Bibliografi',
-    ]
-
-    section = _find_section_text(full, METODE_START, METODE_END, max_chars=800)
-
-    if not section or len(section.strip()) < 10:
-        return "-"
-
-    # Bersihkan teks
-    lines = []
-    for line in section.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        if SNI_FULL_PATTERN.match(line):
-            continue
-        if re.match(r'^©', line):
-            continue
-        if re.match(r'^\d+\s+dari\s+\d+$', line, re.IGNORECASE):
-            continue
-        lines.append(line)
-
-    result = " ".join(lines).strip()
-    result = re.sub(r'\s+', ' ', result)
-    return result[:500] if result else "-"
-
-
-# ─── Parser: keywords ─────────────────────────────────────────────────────────
-def parse_keywords(judul: str, kategori: str, ruang_lingkup: str,
-                   no_sni: str) -> str:
-    """
-    Bangun string keywords yang ringkas dan akurat dari judul dokumen SNI.
-    
-    Strategi: ambil frasa inti dari tiap segmen judul (setelah " - "),
-    hilangkan kata generik di awal, ambil yang paling spesifik.
-    
-    Format target: "audit, sistem manajemen keamanan informasi"
-    """
-    GENERIC_PREFIX = re.compile(
-        r'^(?:pedoman|panduan|teknik|teknologi|cara|metode|spesifikasi|'
-        r'persyaratan|prinsip|sistem|pengantar|petunjuk|petunjuk teknis|'
-        r'informasi tentang|guidelines for|guidance on|requirements for|'
-        r'code of practice for)\s+',
-        re.IGNORECASE
-    )
-    STOP_WORDS = {
-        "standar", "nasional", "indonesia", "dan", "atau", "untuk", "dari",
-        "dengan", "yang", "dalam", "sni", "iso", "iec", "bsn", "ini",
-        "adalah", "pada", "juga", "oleh", "ke", "di", "the", "of", "and",
-        "or", "for", "in", "a", "an", "to", "with", "its", "this",
-        "document", "guidance", "general", "technical", "part",
-        "ditetapkan", "tahun", "bagian", "edisi", "revisi", "adopsi",
-    }
-
-    kws: list[str] = []
-    seen: set[str] = set()
-
-    def add(w: str) -> None:
-        w = re.sub(r'\s+', ' ', w.strip().lower())
-        if w and w not in seen and len(w) > 2 and w not in STOP_WORDS:
-            seen.add(w)
-            kws.append(w)
-
-    # Pecah judul per " - "
-    parts = re.split(r'\s*[-–—]\s*', judul)
-
-    for part in parts:
-        part = part.strip()
-        if len(part) < 4:
-            continue
-        # Hapus prefix generik untuk dapatkan inti
-        core = GENERIC_PREFIX.sub('', part).strip()
-        if core and core.lower() not in STOP_WORDS and len(core) > 3:
-            add(core)
-
-    # Jika keywords terlalu banyak, pertahankan hanya yang paling spesifik:
-    # yaitu yang TIDAK generik (tidak diawali kata seperti "teknologi", "teknik", dll)
-    GENERIC_STANDALONE = re.compile(
-        r'^(teknologi informasi|teknik keamanan|teknik|teknologi|informasi|'
-        r'keamanan|manajemen|sistem)$',
-        re.IGNORECASE
-    )
-    # Filter: buang yang terlalu generik jika sudah ada yang lebih spesifik
-    specific = [k for k in kws if not GENERIC_STANDALONE.match(k)]
-    generic  = [k for k in kws if GENERIC_STANDALONE.match(k)]
-
-    # Dari frasa panjang yang spesifik, juga ekstrak kata kunci pertama
-    # Mis: "audit sistem manajemen keamanan informasi" → tambahkan "audit" saja
-    extra: list[str] = []
-    for phrase in specific:
-        first_word = phrase.split()[0]
-        if (first_word not in seen and len(first_word) > 3
-                and not GENERIC_STANDALONE.match(first_word)):
-            extra.append(first_word)
-
-    # Susun: kata tunggal dulu (lebih ringkas), lalu frasa spesifik
-    # Hapus frasa yang hanya menambahkan kata di depan frasa lain (duplikat)
-    ordered: list[str] = []
-    for w in extra:
-        if w not in ordered:
-            ordered.append(w)
-    for k in specific:
-        # Jangan tambahkan frasa yang diawali kata yang sudah ada di ordered
-        first = k.split()[0]
-        if first in ordered:
-            # Simpan sisa frasa setelah kata pertama sebagai keyword baru
-            rest = " ".join(k.split()[1:]).strip()
-            if rest and rest not in ordered and len(rest) > 4:
-                ordered.append(rest)
-        else:
-            if k not in ordered:
-                ordered.append(k)
-
-    # Prioritaskan yang spesifik, maksimal 3 keywords
-    final = ordered[:3]
-    # Tambah generic hanya jika kurang dari 2 keyword
-    if len(final) < 2:
-        final += [g for g in generic if g not in final][:2 - len(final)]
-
-    return ", ".join(final)
-
-
-# ─── Main extraction entry point ──────────────────────────────────────────────
-def process_file(file_bytes: bytes, filename: str) -> dict:
-    """
-    Proses satu file (bytes) → kembalikan dict siap JSONL.
-    
-    Output keys: no_sni, judul, kategori, ruang_lingkup,
-                 persyaratan, metode_uji, keywords
-    
-    Didesain untuk dipanggil dari ThreadPoolExecutor.
-    """
-    import tempfile
-    import os
-
-    suffix = Path(filename).suffix.lower()
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        tmp.write(file_bytes)
-        tmp_path = Path(tmp.name)
+def _extract_doc_legacy(p: Path) -> str:
+    """Extract text from legacy .doc files."""
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["antiword", str(p)],
+            capture_output=True, text=True, timeout=60
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout
+    except Exception:
+        pass
 
     try:
-        full_text, cover_text = extract_text(tmp_path)
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
+        import subprocess, tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            subprocess.run(
+                ["libreoffice", "--headless", "--convert-to", "txt:Text", "--outdir", tmpdir, str(p)],
+                capture_output=True, timeout=120
+            )
+            txt_file = Path(tmpdir) / (p.stem + ".txt")
+            if txt_file.exists():
+                return txt_file.read_text("utf-8", errors="replace")
+    except Exception:
+        pass
 
-    if not full_text.strip():
+    try:
+        raw = p.read_bytes()
+        texts = re.findall(rb"[\x20-\x7e]{4,}", raw)
+        return " ".join(t.decode("ascii", errors="replace") for t in texts)
+    except Exception:
+        return f"[Cannot extract DOC: {p.name}. Install antiword or LibreOffice]"
+
+
+def _extract_excel_text(p: Path, engine: str = "openpyxl") -> str:
+    """Extract text from Excel files (.xlsx with openpyxl, .xls with xlrd)."""
+    try:
+        import pandas as pd
+        xl = pd.ExcelFile(str(p), engine=engine)
+        parts = []
+        for sheet_name in xl.sheet_names:
+            df = xl.parse(sheet_name)
+            if df.empty:
+                continue
+            parts.append(f"=== Sheet: {sheet_name} ===")
+            # Header row
+            parts.append("\t".join(str(c) for c in df.columns))
+            # Data rows
+            for _, row in df.iterrows():
+                row_text = "\t".join("" if (str(v) == "nan") else str(v) for v in row)
+                if row_text.strip():
+                    parts.append(row_text)
+        return "\n".join(parts) if parts else f"[Empty Excel file: {p.name}]"
+    except ImportError as e:
+        missing = "openpyxl" if engine == "openpyxl" else "xlrd"
+        return f"[Cannot extract Excel: install {missing}. Error: {e}]"
+    except Exception as e:
+        return f"[Cannot extract Excel: {p.name}. Error: {e}]"
+
+
+def _extract_image_text(p: Path) -> str:
+    """Extract text from image using pytesseract OCR."""
+    try:
+        import pytesseract
+        from PIL import Image
+        img = Image.open(str(p))
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        try:
+            text = pytesseract.image_to_string(img, lang="ind+eng")
+        except Exception:
+            text = pytesseract.image_to_string(img)
+        return text.strip()
+    except Exception as e:
+        return f"[Image: {p.name} — Install pytesseract + Tesseract OCR for text extraction. Error: {e}]"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CHUNKING
+# ──────────────────────────────────────────────────────────────────────────────
+
+def clean_text(text: str, remove_extra_spaces: bool = True, remove_special: bool = False) -> str:
+    if remove_extra_spaces:
+        text = re.sub(r"\s+", " ", text).strip()
+        text = re.sub(r"\n{3,}", "\n\n", text)
+    if remove_special:
+        text = re.sub(r"[^\w\s.,!?;:()\-\'\"\n]", "", text)
+    return text.strip()
+
+
+def chunk_text(
+    text: str,
+    chunk_size: int = 512,
+    overlap: int = 50,
+    method: str = "tokens",
+) -> list:
+    text = text.strip()
+    if not text:
+        return []
+
+    if method == "paragraphs":
+        paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+        chunks, current = [], ""
+        for para in paras:
+            if len((current + " " + para).split()) <= chunk_size:
+                current = (current + " " + para).strip()
+            else:
+                if current:
+                    chunks.append(current)
+                current = para
+        if current:
+            chunks.append(current)
+        return chunks
+
+    elif method == "sentences":
+        sentences = re.split(r"(?<=[.!?])\s+", text)
+        chunks, current_words = [], []
+        for sent in sentences:
+            words = sent.split()
+            if len(current_words) + len(words) <= chunk_size:
+                current_words.extend(words)
+            else:
+                if current_words:
+                    chunks.append(" ".join(current_words))
+                current_words = current_words[-overlap:] + words if overlap else words
+        if current_words:
+            chunks.append(" ".join(current_words))
+        return chunks
+
+    else:  # tokens (word-based)
+        words = text.split()
+        chunks = []
+        i = 0
+        while i < len(words):
+            end = min(i + chunk_size, len(words))
+            chunks.append(" ".join(words[i:end]))
+            i += chunk_size - overlap
+            if i < 0:
+                i = chunk_size
+        return chunks
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SNI DOCUMENT FILTER
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Keywords that identify relevant section headings (case-insensitive)
+_SNI_SECTION_KEYWORDS = [
+    # Judul / nomor SNI (ditangani terpisah di extract_sni_sections)
+    # Ruang lingkup / scope
+    r"ruang\s+lingkup", r"\bscope\b",
+    # Persyaratan / mutu / requirement / quality
+    r"persyaratan", r"\bmutu\b", r"\brequirement[s]?\b", r"\bquality\b",
+    r"syarat\s+mutu", r"spesifikasi", r"\bspecification[s]?\b",
+    # Pengujian / metode uji / uji / testing / test method / test / sampling /
+    # verifikasi / verification / validation / validasi
+    r"pengujian", r"metode\s+uji", r"\buji\b", r"\btesting\b",
+    r"test\s+method[s]?", r"\btest[s]?\b", r"\bsampling\b",
+    r"verifikasi", r"\bverification\b", r"\bvalidation\b", r"validasi",
+]
+
+# Normative keyword patterns (sentence-level inclusion)
+_NORMATIVE_PATTERNS = [
+    r"\bharus\b", r"\bshall\b",
+    r"\bsebaiknya\b", r"\bshould\b",
+]
+
+_SNI_SECTION_RE = re.compile(
+    "|".join(_SNI_SECTION_KEYWORDS), re.IGNORECASE
+)
+_NORMATIVE_RE = re.compile(
+    "|".join(_NORMATIVE_PATTERNS), re.IGNORECASE
+)
+# Matches SNI number patterns, e.g. "SNI 01-3140-2010", "SNI ISO 9001:2015"
+_SNI_NUMBER_RE = re.compile(
+    r"\bSNI(?:\s+(?:ISO|IEC|ASTM|EN|BS))?\s+\d[\w\.\-:/]*(?:[:\-]\d[\w\.\-:/]*){0,3}",
+    re.IGNORECASE
+)
+
+
+def extract_sni_sections(raw_text: str) -> str:
+    """
+    Filter raw text from an SNI PDF. Retains only:
+      1. Judul (title block before the first numbered section)
+      2. Nomor SNI (all SNI numbers found in text)
+      3. Ruang lingkup / Scope section content
+      4. Persyaratan / Mutu / Requirement / Quality section content
+      5. Any sentence containing: harus, shall, sebaiknya, should
+      6. Pengujian / Metode uji / Testing / Sampling /
+         Verifikasi / Validasi section content
+    """
+    lines = raw_text.splitlines()
+
+    # ── Pass 1: collect all SNI numbers ─────────────────────────────────────
+    sni_numbers = sorted(set(m.group().strip() for m in _SNI_NUMBER_RE.finditer(raw_text)))
+
+    # ── Pass 2: collect title lines (before first numbered section) ──────────
+    title_lines = []
+    first_section_idx = None
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if not s:
+            continue
+        if re.match(r"^\d{1,2}[\. ]+\S", s):
+            first_section_idx = i
+            break
+        if len(title_lines) < 15:
+            title_lines.append(s)
+
+    # ── Pass 3: walk sections ─────────────────────────────────────────────────
+    kept_sections = []   # list of (section_label, [content_lines])
+    current_label = None
+    current_lines = []
+    in_relevant = False
+
+    start_idx = first_section_idx if first_section_idx is not None else 0
+    for line in lines[start_idx:]:
+        s = line.strip()
+        if not s:
+            if in_relevant and current_lines:
+                current_lines.append("")
+            continue
+
+        is_heading = bool(re.match(r"^\d{1,2}(?:\.\d+)*[\. ]+\S", s))
+
+        if is_heading:
+            # Save previous section if it was relevant and has content
+            if current_label is not None and in_relevant and current_lines:
+                kept_sections.append((current_label, list(current_lines)))
+            current_label = s
+            current_lines = []
+            in_relevant = bool(_SNI_SECTION_RE.search(s))
+        else:
+            if in_relevant:
+                current_lines.append(s)
+            elif _NORMATIVE_RE.search(s):
+                kept_sections.append(("[normative]", [s]))
+
+    # Don't forget last section
+    if current_label is not None and in_relevant and current_lines:
+        kept_sections.append((current_label, list(current_lines)))
+
+    # ── Assemble output ───────────────────────────────────────────────────────
+    parts = []
+
+    if sni_numbers:
+        parts.append("=== Nomor SNI ===")
+        parts.extend(sni_numbers)
+        parts.append("")
+
+    if title_lines:
+        parts.append("=== Judul ===")
+        parts.extend(title_lines)
+        parts.append("")
+
+    for label, content_lines in kept_sections:
+        if label != "[normative]":
+            parts.append(f"=== {label} ===")
+        content_lines_clean = [l for l in content_lines if l != ""]
+        parts.extend(content_lines_clean)
+        parts.append("")
+
+    return "\n".join(parts).strip()
+
+
+def _process_single_file(args) -> dict:
+    """Process a single file — used by parallel executor."""
+    info, settings = args
+    chunk_size = int(settings.get("chunk_size", 512))
+    overlap = int(settings.get("overlap", 50))
+    method = settings.get("chunk_method", "tokens")
+    remove_spaces = settings.get("remove_extra_spaces", True)
+    remove_special = settings.get("remove_special_chars", False)
+    source_tag = settings.get("source_tag", "")
+    output_format = settings.get("output_format", "training")
+
+    try:
+        raw = extract_text_from_file(info["path"], info["ext"])
+        if not raw.strip():
+            return {
+                "file_result": {**info, "status": "empty", "chunks": 0},
+                "items": [],
+                "chars": 0,
+            }
+
+        # Apply SNI section filter for PDF files
+        if info["ext"].lower() == ".pdf":
+            raw = extract_sni_sections(raw)
+            if not raw.strip():
+                return {
+                    "file_result": {**info, "status": "empty", "chunks": 0,
+                                    "note": "No relevant SNI sections found"},
+                    "items": [],
+                    "chars": 0,
+                }
+
+        cleaned = clean_text(raw, remove_spaces, remove_special)
+        chunks = chunk_text(cleaned, chunk_size, overlap, method)
+        items = []
+
+        for idx, chunk in enumerate(chunks):
+            if output_format == "qa":
+                item = {"instruction": "", "input": chunk, "output": ""}
+            elif output_format == "messages":
+                item = {
+                    "messages": [
+                        {"role": "system", "content": "You are a helpful assistant."},
+                        {"role": "user", "content": chunk},
+                        {"role": "assistant", "content": ""},
+                    ]
+                }
+            else:
+                item = {
+                    "id": f"{info['session_id']}_tmp_{idx:04d}",
+                    "text": chunk,
+                    "source": source_tag or info["original_name"],
+                    "chunk_index": idx + 1,
+                    "total_chunks_in_doc": len(chunks),
+                }
+            items.append(item)
+
         return {
-            "_error": f"Teks kosong: {filename}",
-            "no_sni": Path(filename).stem,
-            "judul": Path(filename).stem.replace('_', ' ').replace('-', ' ').title(),
-            "kategori": "Umum",
-            "ruang_lingkup": "",
-            "persyaratan": "-",
-            "metode_uji": "-",
-            "keywords": "",
+            "file_result": {**info, "status": "success", "chunks": len(chunks)},
+            "items": items,
+            "chars": len(cleaned),
         }
 
-    rec = SNIRecord()
-    rec.no_sni        = parse_no_sni(cover_text, full_text, filename)
-    rec.judul         = parse_judul(cover_text, full_text, filename)
-    rec.kategori      = parse_kategori(cover_text, full_text)
-    rec.ruang_lingkup = parse_ruang_lingkup(full_text)
-    rec.persyaratan   = parse_persyaratan(full_text)
-    rec.metode_uji    = parse_metode_uji(full_text)
-    rec.keywords      = parse_keywords(
-        rec.judul, rec.kategori, rec.ruang_lingkup, rec.no_sni
+    except Exception as e:
+        return {
+            "file_result": {**info, "status": "error", "error": str(e), "chunks": 0},
+            "items": [],
+            "chars": 0,
+        }
+
+
+def process_documents(
+    file_infos: list,
+    settings: dict,
+    max_workers: int = 12,
+    progress_callback=None,
+) -> dict:
+    """Process a list of saved file infos into training data using parallel workers."""
+    all_results = [None] * len(file_infos)
+    total = len(file_infos)
+    completed_count = [0]
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_idx = {
+            executor.submit(_process_single_file, (info, settings)): i
+            for i, info in enumerate(file_infos)
+        }
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            all_results[idx] = future.result()
+            completed_count[0] += 1
+            if progress_callback:
+                progress_callback("extract", completed_count[0], total, file_infos[idx]["original_name"])
+
+    all_items = []
+    file_results = []
+    stats = {
+        "total_files": len(file_infos),
+        "processed_files": 0,
+        "failed_files": 0,
+        "total_chunks": 0,
+        "total_chars": 0,
+    }
+
+    for res in all_results:
+        if res is None:
+            continue
+        file_results.append(res["file_result"])
+        all_items.extend(res["items"])
+        if res["file_result"]["status"] == "success":
+            stats["processed_files"] += 1
+            stats["total_chunks"] += res["file_result"]["chunks"]
+            stats["total_chars"] += res["chars"]
+        else:
+            stats["failed_files"] += 1
+
+    session_id = file_infos[0]["session_id"] if file_infos else "sess"
+    for i, item in enumerate(all_items):
+        if isinstance(item, dict) and "id" in item:
+            item["id"] = f"{session_id}_{i + 1:04d}"
+
+    return {
+        "version": "1.0",
+        "type": "training",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "settings": settings,
+        "stats": stats,
+        "file_results": file_results,
+        "total": len(all_items),
+        "total_chunks": len(all_items),
+        "data": all_items,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PARAPHRASE ENGINE (WITHOUT API)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Words that must NEVER be replaced during paraphrasing (normative/modal terms)
+PROTECTED_WORDS = {
+    # English normative
+    "shall", "should", "must", "may", "can", "will", "would",
+    # Indonesian normative
+    "harus", "sebaiknya", "wajib", "boleh", "dapat", "tidak boleh",
+    "dilarang", "dipersyaratkan", "direkomendasikan", "diperbolehkan",
+}
+
+
+def _replace_synonyms(text: str, synonyms_dict: dict, replace_prob: float = 0.7) -> str:
+    """Replace words with their synonyms based on probability, preserving protected words."""
+    words = text.split()
+    for i, word in enumerate(words):
+        clean_word = re.sub(r'[^\w]', '', word.lower())
+        # Skip protected normative/modal words — never replace them
+        if clean_word in PROTECTED_WORDS:
+            continue
+        if clean_word in synonyms_dict and random.random() < replace_prob:
+            synonyms = synonyms_dict[clean_word]
+            synonym = random.choice(synonyms)
+            punctuation = re.findall(r'[^\w]', word)
+            if punctuation:
+                words[i] = synonym + punctuation[-1] if punctuation[-1] else synonym
+            else:
+                words[i] = synonym
+    return " ".join(words)
+
+
+def _rephrase_sentence_structure(text: str) -> str:
+    """Slightly modify sentence structure without changing meaning."""
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    rephrased = []
+
+    for sentence in sentences:
+        if len(sentence.split()) < 5:
+            rephrased.append(sentence)
+            continue
+
+        # Don't restructure sentences containing normative/modal words
+        sentence_lower = sentence.lower()
+        has_protected = any(pw in sentence_lower.split() or
+                            f" {pw} " in f" {sentence_lower} "
+                            for pw in PROTECTED_WORDS)
+        if has_protected:
+            rephrased.append(sentence)
+            continue
+
+        if ',' in sentence:
+            parts = sentence.split(',', 1)
+            if len(parts) == 2 and random.random() < 0.3:
+                sentence = f"{parts[1].strip()} {parts[0].strip()}"
+                sentence = sentence[0].upper() + sentence[1:]
+
+        rephrased.append(sentence)
+
+    return " ".join(rephrased)
+
+
+def _add_transitional_phrases(text: str) -> str:
+    """Add or modify transitional phrases."""
+    indonesian_transitions = [
+        "Selain itu, ", "Sebagai tambahan, ", "Di sisi lain, ",
+        "Dalam konteks ini, ", "Sehubungan dengan itu, ", "Pada dasarnya, "
+    ]
+    english_transitions = [
+        "Additionally, ", "Furthermore, ", "On the other hand, ",
+        "In this context, ", "Related to this, ", "Essentially, "
+    ]
+
+    if len(text.split()) < 30:
+        return text
+
+    if random.random() < 0.2:
+        if any(word in text.lower() for word in ["dan", "yang", "dengan", "untuk", "dari"]):
+            transition = random.choice(indonesian_transitions)
+        else:
+            transition = random.choice(english_transitions)
+        text = transition + text
+
+    return text
+
+
+def paraphrase_text(text: str, language: str = "auto") -> str:
+    """
+    Paraphrase text without using an API.
+    Default language is 'auto' for auto-detection.
+    """
+    if not text.strip():
+        return text
+
+    if language == "id":
+        synonyms = INDONESIAN_SYNONYMS
+    elif language == "en":
+        synonyms = ENGLISH_SYNONYMS
+    else:
+        # Auto-detect language (simple heuristic)
+        if any(word in text.lower() for word in ["dan", "yang", "dengan", "untuk", "dari"]):
+            synonyms = INDONESIAN_SYNONYMS
+        else:
+            synonyms = ENGLISH_SYNONYMS
+
+    paraphrased = _replace_synonyms(text, synonyms)
+    paraphrased = _rephrase_sentence_structure(paraphrased)
+    paraphrased = _add_transitional_phrases(paraphrased)
+
+    return paraphrased
+
+
+def _paraphrase_item_task(args) -> tuple:
+    """Returns (index, paraphrased_item)."""
+    import copy
+    idx, item, language = args
+    item = copy.deepcopy(item)
+    try:
+        if "text" in item:
+            item["text"] = paraphrase_text(item["text"], language)
+        elif "input" in item:
+            item["input"] = paraphrase_text(item["input"], language)
+        elif "messages" in item:
+            for msg in item["messages"]:
+                if msg.get("role") == "user" and msg.get("content"):
+                    msg["content"] = paraphrase_text(msg["content"], language)
+    except Exception:
+        pass
+    return idx, item
+
+
+def paraphrase_dataset(
+    result: dict,
+    language: str = "auto",
+    progress_callback=None,
+    max_workers: int = 10,
+) -> dict:
+    """
+    Paraphrase every text field in result['data'] using parallel processing.
+    Default language is 'auto' for auto-detection.
+    """
+    import copy
+    new_result = copy.deepcopy(result)
+    items = new_result.get("data", [])
+    total = len(items)
+    paraphrased_items = [None] * total
+
+    completed_count = [0]
+    tasks = [(i, item, language) for i, item in enumerate(items)]
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_paraphrase_item_task, task): task[0] for task in tasks}
+        for future in as_completed(futures):
+            idx, para_item = future.result()
+            paraphrased_items[idx] = para_item
+            completed_count[0] += 1
+            if progress_callback:
+                progress_callback(completed_count[0], total)
+
+    if progress_callback:
+        progress_callback(total, total)
+
+    new_result["data"] = paraphrased_items
+    new_result["paraphrased"] = True
+    new_result["paraphrase_language"] = language
+    new_result["paraphrased_at"] = datetime.now(timezone.utc).isoformat()
+    return new_result
+
+
+def process_and_paraphrase(
+    file_infos: list,
+    settings: dict,
+    language: str = "auto",
+    progress_callback=None,
+) -> dict:
+    """
+    One-shot: extract text from files, chunk, then immediately paraphrase.
+    Default language is 'auto' for auto-detection.
+    progress_callback(stage: str, current: int, total: int)
+    """
+    if progress_callback:
+        progress_callback("extract", 0, len(file_infos), "")
+
+    def _extract_cb(stage, cur, tot, fname=""):
+        if progress_callback:
+            progress_callback(stage, cur, tot, fname)
+
+    result = process_documents(file_infos, settings, max_workers=12, progress_callback=_extract_cb)
+
+    if progress_callback:
+        progress_callback("extract", len(file_infos), len(file_infos), "")
+
+    def _para_cb(current, total):
+        if progress_callback:
+            progress_callback("paraphrase", current, total, "")
+
+    para_result = paraphrase_dataset(result, language, _para_cb, max_workers=10)
+    return para_result
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SAVE PROCESSED DATA
+# ──────────────────────────────────────────────────────────────────────────────
+
+def save_processed_data(session_id: str, data: dict, settings: dict) -> dict:
+    session_dir = get_session_dir(session_id)
+    processed_dir = ensure_dir(session_dir / "processed")
+    chunks_dir = ensure_dir(session_dir / "chunks")
+
+    output_path = processed_dir / "output.json"
+    output_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
+
+    chunk_count = 0
+    if isinstance(data.get("data"), list):
+        def _write_chunk(args):
+            i, item = args
+            (chunks_dir / f"chunk_{i + 1:03d}.json").write_text(
+                json.dumps(item, ensure_ascii=False, indent=2), "utf-8"
+            )
+            return i
+
+        with ThreadPoolExecutor(max_workers=20) as executor:
+            results = list(executor.map(_write_chunk, enumerate(data["data"])))
+            chunk_count = len(results)
+
+    metadata = {
+        "session_id": session_id,
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "settings": settings,
+        "stats": {
+            "total_chunks": chunk_count,
+            "output_file": str(output_path),
+            "chunks_directory": str(chunks_dir),
+        },
+    }
+    (session_dir / "metadata.json").write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2), "utf-8"
     )
 
-    d = asdict(rec)
-    d["_source"] = filename
-    return d
+    return {
+        "success": True,
+        "processed_path": str(output_path),
+        "chunks_saved": chunk_count,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# JSON MERGER
+# ──────────────────────────────────────────────────────────────────────────────
+
+def detect_merge_strategy(parsed_files: list, strategy: str = "auto") -> str:
+    if strategy != "auto":
+        return strategy
+    if all(isinstance(f["content"], dict) and isinstance(f["content"].get("data"), list)
+           for f in parsed_files):
+        return "data"
+    if all(isinstance(f["content"], list) for f in parsed_files):
+        return "array"
+    return "object"
+
+
+def merge_json_files(file_contents: list, strategy: str = "auto") -> dict:
+    merge_mode = detect_merge_strategy(file_contents, strategy)
+    stats = {
+        "files_count": len(file_contents),
+        "merge_mode": merge_mode,
+        "item_counts": [],
+    }
+
+    if merge_mode == "data":
+        all_items = []
+        for f in file_contents:
+            items = f["content"].get("data", [])
+            all_items.extend(items)
+            stats["item_counts"].append({"file": f["name"], "items": len(items)})
+        merged = {
+            "version": "1.0",
+            "type": "training",
+            "merged": True,
+            "merged_at": datetime.now(timezone.utc).isoformat(),
+            "source_files": [f["name"] for f in file_contents],
+            "total": len(all_items),
+            "total_chunks": len(all_items),
+            "data": all_items,
+        }
+
+    elif merge_mode == "array":
+        all_items = []
+        for f in file_contents:
+            c = f["content"]
+            if isinstance(c, list):
+                arr = c
+            elif isinstance(c, dict) and isinstance(c.get("data"), list):
+                arr = c["data"]
+            elif isinstance(c, dict):
+                arr = [c]
+            else:
+                arr = []
+            all_items.extend(arr)
+            stats["item_counts"].append({"file": f["name"], "items": len(arr)})
+        merged = all_items
+
+    else:
+        merged = {
+            "_merged": True,
+            "_merged_at": datetime.now(timezone.utc).isoformat(),
+            "_source_files": [f["name"] for f in file_contents],
+        }
+        for f in file_contents:
+            src = f["content"] if isinstance(f["content"], dict) else {"_array_data": f["content"]}
+            merged.update(src)
+            stats["item_counts"].append({"file": f["name"], "keys": len(src)})
+
+    return {"merged": merged, "merge_mode": merge_mode, "stats": stats}

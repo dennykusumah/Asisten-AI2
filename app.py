@@ -1,434 +1,484 @@
 """
-app.py — Training Dataset Generator (Multi-PDF, hingga 200 dokumen)
-CSV langsung download per file (tidak di-zip)
-JSONL tetap bisa download per file atau semua dalam ZIP
+app.py — Streamlit PDF Keyword Extractor
+Uses engine.py (no AI/API) for keyword extraction.
 """
 
 import io
 import csv
 import json
-import zipfile
+import datetime
 import streamlit as st
+import pdfplumber
 
-from engine import engine1_daftar_isi, engine2_keywords, engine3_ringkasan, engine4_jsonl
+from engine import extract_keywords, document_stats
 
+# ─── Page Config ────────────────────────────────────────────────────────────────
 
-# ─────────────────────────────────────────────
-# Konfigurasi halaman
-# ─────────────────────────────────────────────
 st.set_page_config(
-    page_title="Training Dataset Generator",
-    page_icon="🤖",
+    page_title="PDF Keyword Extractor",
+    page_icon="🔑",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
+# ─── Custom CSS ─────────────────────────────────────────────────────────────────
+
 st.markdown("""
 <style>
-body, .stApp { background-color: #0d1117; color: #cdd6f4; }
+    @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;600;700&display=swap');
 
-.main-header {
-    background: linear-gradient(135deg,#1a1a2e,#16213e,#0f3460);
-    padding:2rem; border-radius:14px; margin-bottom:1.8rem; text-align:center;
-}
-.main-header h1 { color:#e94560; margin:0; font-size:2.1rem; letter-spacing:1px; }
-.main-header p  { color:#a8b2d8; margin:.5rem 0 0; font-size:.95rem; }
+    html, body, [class*="css"] {
+        font-family: 'IBM Plex Sans', sans-serif;
+    }
 
-[data-testid="stFileUploader"] {
-    border: 2px dashed #334155 !important;
-    border-radius: 12px !important;
-    background: #161b27 !important;
-    padding: 1.2rem !important;
-}
-[data-testid="stFileUploader"]:hover { border-color: #e94560 !important; }
+    .stApp {
+        background-color: #0d1117;
+        color: #e6edf3;
+    }
 
-.doc-card {
-    background:#1e1e2e; border:1px solid #2a2a3e;
-    border-radius:10px; padding:1rem; margin-bottom:.7rem;
-}
-.badge {
-    display:inline-block; padding:.15rem .55rem; border-radius:20px;
-    font-size:.72rem; font-weight:700; margin-right:.3rem;
-}
-.badge-ok    { background:#1e3a2f; color:#a6e3a1; }
-.badge-error { background:#3a1e1e; color:#f38ba8; }
-.badge-wait  { background:#2a2a3e; color:#cba6f7; }
-.badge-run   { background:#2a3040; color:#89b4fa; }
+    /* Sidebar */
+    section[data-testid="stSidebar"] {
+        background-color: #161b22;
+        border-right: 1px solid #30363d;
+    }
 
-.preview-box {
-    background:#161b27; border:1px solid #2a2a3e; border-radius:8px;
-    padding:1rem; font-size:.85rem; line-height:1.7;
-    max-height:280px; overflow-y:auto; color:#cdd6f4;
-}
-.engine-card {
-    background:#1e1e2e; border:1px solid #2a2a3e;
-    border-radius:10px; padding:1rem; margin-bottom:.8rem;
-}
-.engine-card h4 { color:#cdd6f4; margin:0 0 .35rem; font-size:.9rem; }
-.engine-card p  { color:#7f849c; font-size:.78rem; margin:0; line-height:1.5; }
+    /* Header */
+    .main-header {
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 2rem;
+        font-weight: 600;
+        color: #58a6ff;
+        letter-spacing: -0.5px;
+        margin-bottom: 0;
+    }
+    .main-subheader {
+        font-family: 'IBM Plex Sans', sans-serif;
+        font-size: 0.9rem;
+        color: #8b949e;
+        margin-top: 4px;
+        margin-bottom: 24px;
+    }
 
-.stButton>button {
-    background:linear-gradient(135deg,#e94560,#c62a47) !important;
-    color:#fff !important; border:none !important;
-    border-radius:8px !important; font-weight:600 !important;
-}
-.stButton>button:hover {
-    background:linear-gradient(135deg,#c62a47,#a01f39) !important;
-}
+    /* Stat cards */
+    .stat-card {
+        background: #161b22;
+        border: 1px solid #30363d;
+        border-radius: 8px;
+        padding: 16px 20px;
+        text-align: center;
+    }
+    .stat-value {
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 1.6rem;
+        font-weight: 600;
+        color: #58a6ff;
+    }
+    .stat-label {
+        font-size: 0.75rem;
+        color: #8b949e;
+        margin-top: 4px;
+        text-transform: uppercase;
+        letter-spacing: 0.8px;
+    }
 
-[data-testid="stDownloadButton"]>button {
-    background:linear-gradient(135deg,#1c6b38,#14522b) !important;
-    color:#a6e3a1 !important; border:none !important;
-    border-radius:8px !important; font-weight:600 !important;
-    width:100%;
-}
-[data-testid="stDownloadButton"]>button:hover {
-    background:linear-gradient(135deg,#14522b,#0e3d20) !important;
-}
+    /* Keyword tags */
+    .kw-tag {
+        display: inline-block;
+        padding: 4px 12px;
+        border-radius: 20px;
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 0.8rem;
+        font-weight: 600;
+        margin: 4px;
+        border: 1px solid;
+    }
+    .kw-high   { background: #1f3a5f; border-color: #58a6ff; color: #a5d3ff; }
+    .kw-medium { background: #1f3524; border-color: #3fb950; color: #7ee787; }
+    .kw-low    { background: #2d2416; border-color: #d29922; color: #e3b341; }
 
-.stTabs [data-baseweb="tab"]   { color:#7f849c; }
-.stTabs [aria-selected="true"] { color:#e94560 !important; border-bottom:2px solid #e94560 !important; }
+    /* Table */
+    .kw-table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 0.88rem;
+    }
+    .kw-table th {
+        background: #1c2128;
+        color: #8b949e;
+        text-transform: uppercase;
+        font-size: 0.72rem;
+        letter-spacing: 1px;
+        padding: 10px 14px;
+        text-align: left;
+        border-bottom: 1px solid #30363d;
+        font-family: 'IBM Plex Mono', monospace;
+    }
+    .kw-table td {
+        padding: 9px 14px;
+        border-bottom: 1px solid #21262d;
+        color: #e6edf3;
+    }
+    .kw-table tr:hover td {
+        background: #1c2128;
+    }
+    .kw-table .rank {
+        color: #6e7681;
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 0.78rem;
+    }
+    .kw-table .score {
+        font-family: 'IBM Plex Mono', monospace;
+        color: #58a6ff;
+        font-size: 0.82rem;
+    }
+    .method-badge {
+        display: inline-block;
+        background: #1f2d3d;
+        border: 1px solid #264f78;
+        border-radius: 4px;
+        padding: 2px 7px;
+        font-size: 0.7rem;
+        color: #79c0ff;
+        font-family: 'IBM Plex Mono', monospace;
+    }
+    .score-bar-bg {
+        background: #21262d;
+        border-radius: 4px;
+        height: 6px;
+        width: 100%;
+        margin-top: 4px;
+    }
+    .score-bar-fill {
+        background: linear-gradient(90deg, #1f6feb, #58a6ff);
+        border-radius: 4px;
+        height: 6px;
+    }
 
-.counter-chip {
-    background:#16213e; border:1px solid #0f3460; border-radius:20px;
-    padding:.3rem .9rem; color:#89b4fa; font-size:.85rem; display:inline-block;
-    margin:.5rem .3rem 1rem;
-}
+    /* Buttons */
+    .stDownloadButton > button {
+        background: #1f6feb !important;
+        color: #ffffff !important;
+        border: none !important;
+        border-radius: 6px !important;
+        font-family: 'IBM Plex Mono', monospace !important;
+        font-weight: 600 !important;
+        letter-spacing: 0.3px !important;
+        padding: 8px 20px !important;
+    }
+    .stDownloadButton > button:hover {
+        background: #388bfd !important;
+    }
+
+    /* Upload area */
+    .uploadedFile {
+        background: #161b22 !important;
+        border: 1px dashed #30363d !important;
+        border-radius: 8px !important;
+    }
+
+    /* Divider */
+    hr { border-color: #30363d; }
+
+    /* Slider */
+    .stSlider > div > div { color: #58a6ff; }
+
+    /* Select box */
+    .stSelectbox label { color: #8b949e; font-size: 0.82rem; }
+
+    /* Section titles */
+    .section-title {
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 0.8rem;
+        color: #8b949e;
+        text-transform: uppercase;
+        letter-spacing: 1.2px;
+        border-bottom: 1px solid #21262d;
+        padding-bottom: 8px;
+        margin-bottom: 16px;
+    }
+
+    /* Badge pill */
+    .badge {
+        display: inline-block;
+        background: #0d419d;
+        color: #79c0ff;
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 0.7rem;
+        padding: 2px 8px;
+        border-radius: 12px;
+        margin-left: 8px;
+    }
+    
+    .empty-state {
+        text-align: center;
+        padding: 60px 20px;
+        color: #8b949e;
+        border: 1px dashed #30363d;
+        border-radius: 12px;
+        margin-top: 16px;
+    }
+    .empty-state .icon { font-size: 3rem; }
+    .empty-state p { margin-top: 12px; font-size: 0.9rem; }
 </style>
 """, unsafe_allow_html=True)
 
 
-# ─────────────────────────────────────────────
-# Session-state init
-# ─────────────────────────────────────────────
-if "docs" not in st.session_state:
-    st.session_state.docs = {}
+# ─── Helpers ────────────────────────────────────────────────────────────────────
+
+def extract_text_from_pdf(uploaded_file) -> str:
+    """Extract all text from uploaded PDF using pdfplumber."""
+    text_parts = []
+    with pdfplumber.open(uploaded_file) as pdf:
+        for page in pdf.pages:
+            t = page.extract_text()
+            if t:
+                text_parts.append(t)
+    return "\n".join(text_parts)
 
 
-# ─────────────────────────────────────────────
-# Helper: build CSV bytes (1 baris data, 3 kolom)
-# ─────────────────────────────────────────────
-def build_csv(daftar_isi: str, keywords: str, ringkasan: str) -> bytes:
+def score_class(score: float, all_scores: list) -> str:
+    if not all_scores:
+        return "kw-medium"
+    mx = max(all_scores)
+    if mx == 0:
+        return "kw-medium"
+    ratio = score / mx
+    if ratio >= 0.6:
+        return "kw-high"
+    elif ratio >= 0.3:
+        return "kw-medium"
+    return "kw-low"
+
+
+def build_csv(keywords: list) -> bytes:
     buf = io.StringIO()
-    writer = csv.writer(buf, quoting=csv.QUOTE_ALL)
-    writer.writerow(["Daftar Isi", "Keywords", "Ringkasan"])
-    writer.writerow([daftar_isi or "", keywords or "", ringkasan or ""])
-    return buf.getvalue().encode("utf-8-sig")
+    writer = csv.DictWriter(buf, fieldnames=["rank", "keyword", "score", "method"])
+    writer.writeheader()
+    for i, kw in enumerate(keywords, 1):
+        writer.writerow({"rank": i, **kw})
+    return buf.getvalue().encode("utf-8")
 
 
-def build_zip_jsonl(docs: dict) -> bytes:
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for fname, d in docs.items():
-            if d["e4"]:
-                base = fname.replace(".pdf", "")
-                zf.writestr(f"{base}_training_data.jsonl", d["e4"].encode("utf-8"))
-    buf.seek(0)
-    return buf.getvalue()
+def build_json(keywords: list, stats: dict, filename: str) -> bytes:
+    payload = {
+        "source_file": filename,
+        "extracted_at": datetime.datetime.now().isoformat(),
+        "document_stats": stats,
+        "keywords": [{"rank": i + 1, **kw} for i, kw in enumerate(keywords)],
+    }
+    return json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8")
 
 
-# ─────────────────────────────────────────────
-# HEADER
-# ─────────────────────────────────────────────
-st.markdown("""
-<div class="main-header">
-    <h1>🤖 Training Dataset Generator</h1>
-    <p>Upload hingga 200 PDF · Engine 1-3 → CSV · Engine 4 → JSONL · Tanpa API Key</p>
+def build_txt(keywords: list) -> bytes:
+    lines = ["EXTRACTED KEYWORDS", "=" * 40, ""]
+    for i, kw in enumerate(keywords, 1):
+        lines.append(f"{i:3}. {kw['keyword']} (score: {kw['score']}) [{kw['method']}]")
+    return "\n".join(lines).encode("utf-8")
+
+
+# ─── Sidebar ────────────────────────────────────────────────────────────────────
+
+with st.sidebar:
+    st.markdown("### ⚙️ Extraction Settings")
+    st.markdown("---")
+
+    method = st.selectbox(
+        "Extraction Method",
+        options=["ensemble", "tfidf", "rake", "frequency"],
+        index=0,
+        format_func=lambda x: {
+            "ensemble": "🔀 Ensemble (Recommended)",
+            "tfidf": "📊 TF-IDF",
+            "rake": "🌿 RAKE",
+            "frequency": "📈 Frequency + Bigrams",
+        }[x],
+        help="Choose the algorithm to extract keywords.",
+    )
+
+    top_n = st.slider("Max Keywords", min_value=5, max_value=100, value=30, step=5)
+
+    min_score = st.slider(
+        "Min Score Threshold", min_value=0.0, max_value=1.0, value=0.0, step=0.05,
+        help="Filter out keywords below this normalized score.",
+    )
+
+    st.markdown("---")
+    st.markdown("### ℹ️ About")
+    st.markdown("""
+<div style='font-size:0.8rem; color:#8b949e; line-height:1.6'>
+<b style='color:#e6edf3'>Methods used:</b><br>
+• <b style='color:#58a6ff'>TF-IDF</b> — term importance vs. document frequency<br>
+• <b style='color:#3fb950'>RAKE</b> — rapid phrase extraction via stopword splitting<br>
+• <b style='color:#d29922'>Frequency</b> — unigram + bigram frequency analysis<br><br>
+<b style='color:#e6edf3'>No AI / external API used.</b><br>
+All computation is local & offline.
 </div>
 """, unsafe_allow_html=True)
 
 
-# ─────────────────────────────────────────────
-# SIDEBAR
-# ─────────────────────────────────────────────
-with st.sidebar:
-    st.markdown("### ⚙️ Engine")
-    for icon, title, desc in [
-        ("🔍","Engine 1 — Daftar Isi",
-         "Ekstrak daftar isi, hapus titik-titik & nomor halaman, pisahkan dengan (;)"),
-        ("🏷️","Engine 2 — Keywords",
-         "Hasilkan kata kunci penting dari isi dokumen"),
-        ("📝","Engine 3 — Ringkasan",
-         "Ringkas dokumen. Dwibahasa → fokus bagian Indonesia"),
-        ("🔄","Engine 4 — JSONL",
-         "Konversi isi ke pasangan prompt-completion format JSONL"),
-    ]:
-        st.markdown(f"""
-        <div class="engine-card">
-            <h4>{icon} {title}</h4><p>{desc}</p>
-        </div>""", unsafe_allow_html=True)
+# ─── Main ────────────────────────────────────────────────────────────────────────
 
-    st.divider()
-    st.markdown("### 📊 Statistik")
-    n_total  = len(st.session_state.docs)
-    n_csv_ok = sum(1 for d in st.session_state.docs.values() if d["e1"] or d["e2"] or d["e3"])
-    n_jsl_ok = sum(1 for d in st.session_state.docs.values() if d["e4"])
-    st.markdown(f"""
-    <div class="counter-chip">📄 {n_total} dokumen</div>
-    <div class="counter-chip">📊 {n_csv_ok} CSV siap</div>
-    <div class="counter-chip">📋 {n_jsl_ok} JSONL siap</div>
-    """, unsafe_allow_html=True)
+st.markdown('<p class="main-header">🔑 PDF Keyword Extractor</p>', unsafe_allow_html=True)
+st.markdown('<p class="main-subheader">Upload a PDF and instantly extract meaningful keywords — no AI, no API, fully offline.</p>', unsafe_allow_html=True)
 
-    if st.button("🗑️ Hapus Semua Dokumen", use_container_width=True):
-        st.session_state.docs = {}
-        st.rerun()
-
-
-# ─────────────────────────────────────────────
-# UPLOAD
-# ─────────────────────────────────────────────
-st.markdown("## 📂 Upload Dokumen PDF")
-st.caption("Drag & drop atau klik untuk memilih file · Maksimal 200 PDF sekaligus")
-
-uploaded_files = st.file_uploader(
-    label="Drag & drop PDF di sini",
+uploaded_file = st.file_uploader(
+    label="Drag & drop or click to upload a PDF",
     type=["pdf"],
-    accept_multiple_files=True,
-    label_visibility="collapsed",
+    accept_multiple_files=False,
+    label_visibility="visible",
 )
 
-if uploaded_files:
-    new_count = 0
-    for uf in uploaded_files:
-        if len(st.session_state.docs) >= 200:
-            break
-        if uf.name not in st.session_state.docs:
-            data = uf.read()
-            st.session_state.docs[uf.name] = {
-                "bytes": data, "size": len(data),
-                "e1": None, "e2": None, "e3": None, "e4": None,
-                "status": {"e1":"wait","e2":"wait","e3":"wait","e4":"wait"},
-            }
-            new_count += 1
-    if new_count:
-        st.success(f"✅ {new_count} dokumen baru ditambahkan.")
-
-if not st.session_state.docs:
-    st.info("⬆️ Upload minimal satu file PDF untuk memulai.")
+if uploaded_file is None:
+    st.markdown("""
+    <div class="empty-state">
+        <div class="icon">📄</div>
+        <p>Upload a PDF file to begin extracting keywords.<br>
+        Supports any text-based PDF document.</p>
+    </div>
+    """, unsafe_allow_html=True)
     st.stop()
 
+# ─── Processing ─────────────────────────────────────────────────────────────────
 
-# ─────────────────────────────────────────────
-# TOMBOL AKSI
-# ─────────────────────────────────────────────
-st.markdown("---")
-c1, c2, c3 = st.columns(3)
-run_csv_btn   = c1.button("▶ Engine 1+2+3  →  CSV",    use_container_width=True)
-run_jsonl_btn = c2.button("▶ Engine 4  →  JSONL",       use_container_width=True)
-run_all_btn   = c3.button("🚀 Semua Engine (CSV+JSONL)", use_container_width=True)
-
-
-# ─────────────────────────────────────────────
-# Helper: proses per dokumen
-# ─────────────────────────────────────────────
-def run_engines_csv(fname: str):
-    d = st.session_state.docs[fname]
-    for key, fn in [("e1", engine1_daftar_isi),
-                    ("e2", engine2_keywords),
-                    ("e3", engine3_ringkasan)]:
-        d["status"][key] = "running"
-        try:
-            d[key] = fn(d["bytes"])
-            d["status"][key] = "ok"
-        except Exception as ex:
-            d[key] = f"[ERROR] {ex}"
-            d["status"][key] = "error"
-
-
-def run_engine_jsonl(fname: str):
-    d = st.session_state.docs[fname]
-    d["status"]["e4"] = "running"
+with st.spinner("📖 Reading PDF..."):
     try:
-        d["e4"] = engine4_jsonl(d["bytes"], fname)
-        d["status"]["e4"] = "ok"
-    except Exception as ex:
-        d["e4"] = ""
-        d["status"]["e4"] = "error"
+        raw_text = extract_text_from_pdf(uploaded_file)
+    except Exception as e:
+        st.error(f"❌ Failed to read PDF: {e}")
+        st.stop()
 
+if not raw_text or len(raw_text.strip()) < 100:
+    st.warning("⚠️ The PDF appears to have very little extractable text (may be scanned/image-based). Try a text-based PDF.")
+    st.stop()
 
-# ─────────────────────────────────────────────
-# Eksekusi — doc_list diambil SETELAH tombol ditekan
-# ─────────────────────────────────────────────
-if run_csv_btn or run_all_btn:
-    doc_list = list(st.session_state.docs.keys())
-    if doc_list:
-        st.markdown("### ⏳ Memproses Engine 1 · 2 · 3")
-        prog = st.progress(0, text="Memulai...")
-        stat_box = st.empty()
-        for i, fname in enumerate(doc_list):
-            prog.progress(i / len(doc_list), text=f"[{i+1}/{len(doc_list)}] {fname}")
-            stat_box.info(f"🔄 Memproses: **{fname}**")
-            run_engines_csv(fname)
-        prog.progress(1.0, text="✅ Engine 1·2·3 selesai!")
-        stat_box.success(f"✅ {len(doc_list)} dokumen diproses (CSV).")
+with st.spinner("🔍 Extracting keywords..."):
+    keywords = extract_keywords(raw_text, method=method, top_n=top_n, min_score=min_score)
+    stats = document_stats(raw_text)
 
-if run_jsonl_btn or run_all_btn:
-    doc_list = list(st.session_state.docs.keys())
-    if doc_list:
-        st.markdown("### ⏳ Memproses Engine 4 (JSONL)")
-        prog4 = st.progress(0, text="Memulai Engine 4...")
-        stat4 = st.empty()
-        for i, fname in enumerate(doc_list):
-            prog4.progress(i / len(doc_list), text=f"[{i+1}/{len(doc_list)}] {fname}")
-            stat4.info(f"🔄 Memproses: **{fname}**")
-            run_engine_jsonl(fname)
-        prog4.progress(1.0, text="✅ Engine 4 selesai!")
-        stat4.success(f"✅ {len(doc_list)} dokumen diproses (JSONL).")
+if not keywords:
+    st.warning("No keywords found with current settings. Try lowering the minimum score threshold.")
+    st.stop()
 
+# ─── Document Stats ──────────────────────────────────────────────────────────────
 
-# ─────────────────────────────────────────────
-# DAFTAR DOKUMEN + STATUS + DOWNLOAD
-# ─────────────────────────────────────────────
-st.markdown("---")
-st.markdown(f"## 📄 Daftar Dokumen ({len(st.session_state.docs)})")
+st.markdown('<p class="section-title">Document Overview</p>', unsafe_allow_html=True)
+c1, c2, c3, c4, c5 = st.columns(5)
+for col, label, value in zip(
+    [c1, c2, c3, c4, c5],
+    ["Words", "Sentences", "Unique Tokens", "Characters", "Keywords Found"],
+    [stats["total_words"], stats["total_sentences"], stats["unique_tokens"],
+     stats["total_chars"], len(keywords)],
+):
+    col.markdown(f"""
+    <div class="stat-card">
+        <div class="stat-value">{value:,}</div>
+        <div class="stat-label">{label}</div>
+    </div>
+    """, unsafe_allow_html=True)
 
-BADGE = {
-    "wait":    '<span class="badge badge-wait">⏳ Belum</span>',
-    "running": '<span class="badge badge-run">🔄 Proses</span>',
-    "ok":      '<span class="badge badge-ok">✅ OK</span>',
-    "error":   '<span class="badge badge-error">❌ Error</span>',
-}
+st.markdown("<br>", unsafe_allow_html=True)
 
-for fname, d in st.session_state.docs.items():
-    s = d["status"]
-    size_kb = d["size"] / 1024
+# ─── Tabs: Visual / Table / Text ────────────────────────────────────────────────
 
-    with st.expander(f"📄 {fname}  ({size_kb:.1f} KB)", expanded=False):
-        st.markdown(
-            f'<div class="doc-card">'
-            f'<b>{fname}</b> &nbsp; <span style="color:#585b70;font-size:.8rem">{size_kb:.1f} KB</span><br/>'
-            f'<div style="margin-top:.5rem">'
-            f'Engine1: {BADGE[s["e1"]]}&nbsp;'
-            f'Engine2: {BADGE[s["e2"]]}&nbsp;'
-            f'Engine3: {BADGE[s["e3"]]}&nbsp;'
-            f'Engine4: {BADGE[s["e4"]]}'
-            f'</div></div>',
-            unsafe_allow_html=True,
-        )
+tab1, tab2, tab3 = st.tabs(["☁️ Tag Cloud", "📋 Table View", "📄 Raw Text"])
 
-        # Preview tabs
-        tab_e1, tab_e2, tab_e3, tab_e4 = st.tabs(
-            ["📋 Daftar Isi", "🏷️ Keywords", "📝 Ringkasan", "📄 JSONL"]
-        )
-        with tab_e1:
-            if d["e1"]:
-                items = [i.strip() for i in d["e1"].split(";") if i.strip()]
-                for idx, item in enumerate(items, 1):
-                    st.markdown(f"**{idx}.** {item}")
-                st.caption(f"Total: {len(items)} item")
-            else:
-                st.caption("Belum diproses.")
-        with tab_e2:
-            if d["e2"]:
-                kws = [k.strip() for k in d["e2"].split(",") if k.strip()]
-                cols = st.columns(3)
-                for idx, kw in enumerate(kws):
-                    cols[idx % 3].markdown(f"🔹 {kw}")
-                st.caption(f"Total: {len(kws)} keyword")
-            else:
-                st.caption("Belum diproses.")
-        with tab_e3:
-            if d["e3"]:
-                st.markdown(f'<div class="preview-box">{d["e3"]}</div>', unsafe_allow_html=True)
-            else:
-                st.caption("Belum diproses.")
-        with tab_e4:
-            if d["e4"]:
-                lines = d["e4"].strip().splitlines()
-                st.caption(f"Total: {len(lines)} baris JSONL")
-                for idx, line in enumerate(lines[:5], 1):
-                    try:
-                        obj = json.loads(line)
-                        with st.expander(f"Baris {idx}: {str(obj.get('prompt',''))[:55]}..."):
-                            st.json(obj)
-                    except Exception:
-                        st.code(line, language="json")
-                if len(lines) > 5:
-                    st.caption(f"... dan {len(lines)-5} baris lainnya")
-            else:
-                st.caption("Belum diproses.")
+all_scores = [kw["score"] for kw in keywords]
 
-        # ── Download individual ──
-        st.markdown("**⬇️ Download:**")
-        dl_cols = st.columns(2)
-        with dl_cols[0]:
-            if d["e1"] or d["e2"] or d["e3"]:
-                csv_bytes = build_csv(d["e1"] or "", d["e2"] or "", d["e3"] or "")
-                st.download_button(
-                    label=f"📊 CSV — {fname.replace('.pdf','')}",
-                    data=csv_bytes,
-                    file_name=fname.replace(".pdf", "_training_data.csv"),
-                    mime="text/csv",
-                    use_container_width=True,
-                    key=f"csv_{fname}",
-                )
-        with dl_cols[1]:
-            if d["e4"]:
-                st.download_button(
-                    label=f"📄 JSONL — {fname.replace('.pdf','')}",
-                    data=d["e4"].encode("utf-8"),
-                    file_name=fname.replace(".pdf", "_training_data.jsonl"),
-                    mime="application/json",
-                    use_container_width=True,
-                    key=f"jsonl_{fname}",
-                )
+with tab1:
+    st.markdown('<p class="section-title">Keywords — Visual Overview</p>', unsafe_allow_html=True)
+    tag_html = ""
+    for kw in keywords:
+        css_cls = score_class(kw["score"], all_scores)
+        tag_html += f'<span class="kw-tag {css_cls}">{kw["keyword"]}</span>'
+    st.markdown(f'<div style="line-height:2.4">{tag_html}</div>', unsafe_allow_html=True)
+    st.markdown("""
+    <div style='margin-top:16px; font-size:0.76rem; color:#6e7681'>
+        <span class='kw-tag kw-high' style='font-size:0.7rem'>high</span>
+        <span class='kw-tag kw-medium' style='font-size:0.7rem'>medium</span>
+        <span class='kw-tag kw-low' style='font-size:0.7rem'>low</span>
+        &nbsp; relevance tiers
+    </div>
+    """, unsafe_allow_html=True)
 
+with tab2:
+    st.markdown('<p class="section-title">Keywords — Detailed Table</p>', unsafe_allow_html=True)
+    max_score = max(all_scores) if all_scores else 1
 
-# ─────────────────────────────────────────────
-# DOWNLOAD SEMUA
-# ─────────────────────────────────────────────
-st.markdown("---")
-st.markdown("## ⬇️ Download Semua Output")
+    rows_html = ""
+    for i, kw in enumerate(keywords, 1):
+        pct = int((kw["score"] / max_score) * 100) if max_score else 0
+        rows_html += f"""
+        <tr>
+            <td class="rank">#{i}</td>
+            <td><b>{kw['keyword']}</b>
+                <div class="score-bar-bg"><div class="score-bar-fill" style="width:{pct}%"></div></div>
+            </td>
+            <td class="score">{kw['score']}</td>
+            <td><span class="method-badge">{kw['method']}</span></td>
+        </tr>
+        """
 
-has_csv  = any(d["e1"] or d["e2"] or d["e3"] for d in st.session_state.docs.values())
-has_json = any(d["e4"] for d in st.session_state.docs.values())
+    st.markdown(f"""
+    <table class="kw-table">
+        <thead>
+            <tr>
+                <th>#</th>
+                <th>Keyword</th>
+                <th>Score</th>
+                <th>Method</th>
+            </tr>
+        </thead>
+        <tbody>
+            {rows_html}
+        </tbody>
+    </table>
+    """, unsafe_allow_html=True)
 
-# ── CSV: tampilkan per file (tidak di-zip) ──
-st.markdown("#### 📊 Download CSV per Dokumen")
-if has_csv:
-    csv_docs = [(fname, d) for fname, d in st.session_state.docs.items()
-                if d["e1"] or d["e2"] or d["e3"]]
-    # Tampilkan tombol download per file dalam grid 3 kolom
-    n_cols = 3
-    rows = [csv_docs[i:i+n_cols] for i in range(0, len(csv_docs), n_cols)]
-    for row in rows:
-        cols = st.columns(n_cols)
-        for col, (fname, d) in zip(cols, row):
-            csv_bytes = build_csv(d["e1"] or "", d["e2"] or "", d["e3"] or "")
-            col.download_button(
-                label=f"📊 {fname.replace('.pdf','')[:25]}",
-                data=csv_bytes,
-                file_name=fname.replace(".pdf", "_training_data.csv"),
-                mime="text/csv",
-                use_container_width=True,
-                key=f"bulk_csv_{fname}",
-            )
-else:
-    st.info("Jalankan Engine 1+2+3 terlebih dahulu.")
-
-st.markdown("#### 📄 Semua JSONL dalam satu ZIP")
-n_jl = sum(1 for d in st.session_state.docs.values() if d["e4"])
-st.caption(f"{n_jl} JSONL siap")
-if has_json:
-    zip_jl = build_zip_jsonl(st.session_state.docs)
-    st.download_button(
-        label="⬇️ Download semua JSONL (.zip)",
-        data=zip_jl,
-        file_name="training_data_jsonl.zip",
-        mime="application/zip",
-        use_container_width=False,
-        key="dl_zip_jsonl",
+with tab3:
+    st.markdown('<p class="section-title">Extracted Raw Text</p>', unsafe_allow_html=True)
+    st.text_area(
+        label="",
+        value=raw_text[:5000] + ("\n\n[... truncated for display ...]" if len(raw_text) > 5000 else ""),
+        height=350,
+        label_visibility="collapsed",
     )
-else:
-    st.info("Jalankan Engine 4 terlebih dahulu.")
+    st.caption(f"Showing first 5,000 of {len(raw_text):,} characters.")
 
+# ─── Download Section ────────────────────────────────────────────────────────────
 
-# ─────────────────────────────────────────────
-# FOOTER
-# ─────────────────────────────────────────────
 st.markdown("---")
-st.markdown(
-    "<center><small>🤖 Training Dataset Generator · Pemrosesan Lokal (tanpa API) · "
-    "Upload hingga 200 PDF · Output: CSV + JSONL per dokumen</small></center>",
-    unsafe_allow_html=True,
-)
+st.markdown('<p class="section-title">Download Results</p>', unsafe_allow_html=True)
+
+base_name = uploaded_file.name.replace(".pdf", "")
+timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+dl_csv, dl_json, dl_txt = st.columns(3)
+
+with dl_csv:
+    st.download_button(
+        label="⬇️ Download CSV",
+        data=build_csv(keywords),
+        file_name=f"keywords_{base_name}_{timestamp}.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+with dl_json:
+    st.download_button(
+        label="⬇️ Download JSON",
+        data=build_json(keywords, stats, uploaded_file.name),
+        file_name=f"keywords_{base_name}_{timestamp}.json",
+        mime="application/json",
+        use_container_width=True,
+    )
+
+with dl_txt:
+    st.download_button(
+        label="⬇️ Download TXT",
+        data=build_txt(keywords),
+        file_name=f"keywords_{base_name}_{timestamp}.txt",
+        mime="text/plain",
+        use_container_width=True,
+    )
+
+st.caption(f"📄 Source: **{uploaded_file.name}** &nbsp;|&nbsp; Method: **{method}** &nbsp;|&nbsp; {len(keywords)} keywords extracted")

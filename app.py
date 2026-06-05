@@ -302,29 +302,32 @@ def run_engine_jsonl(fname: str):
 # ─────────────────────────────────────────────
 # Eksekusi engine dengan progress bar
 # ─────────────────────────────────────────────
-doc_list = list(st.session_state.docs.keys())
-
+# PENTING: doc_list diambil di sini agar selalu up-to-date saat tombol ditekan
 if run_csv_btn or run_all_btn:
-    st.markdown("### ⏳ Memproses Engine 1 · 2 · 3")
-    prog = st.progress(0, text="Memulai...")
-    stat_box = st.empty()
-    for i, fname in enumerate(doc_list):
-        prog.progress((i) / len(doc_list), text=f"[{i+1}/{len(doc_list)}] {fname} — Engine 1,2,3")
-        stat_box.info(f"🔄 Memproses: **{fname}**")
-        run_engines_csv(fname)
-    prog.progress(1.0, text="✅ Engine 1·2·3 selesai untuk semua dokumen!")
-    stat_box.success(f"✅ {len(doc_list)} dokumen diproses (CSV).")
+    doc_list = list(st.session_state.docs.keys())
+    if doc_list:
+        st.markdown("### ⏳ Memproses Engine 1 · 2 · 3")
+        prog = st.progress(0, text="Memulai...")
+        stat_box = st.empty()
+        for i, fname in enumerate(doc_list):
+            prog.progress(i / len(doc_list), text=f"[{i+1}/{len(doc_list)}] {fname} — Engine 1,2,3")
+            stat_box.info(f"🔄 Memproses: **{fname}**")
+            run_engines_csv(fname)
+        prog.progress(1.0, text="✅ Engine 1·2·3 selesai untuk semua dokumen!")
+        stat_box.success(f"✅ {len(doc_list)} dokumen diproses (CSV).")
 
 if run_jsonl_btn or run_all_btn:
-    st.markdown("### ⏳ Memproses Engine 4 (JSONL)")
-    prog4 = st.progress(0, text="Memulai Engine 4...")
-    stat4 = st.empty()
-    for i, fname in enumerate(doc_list):
-        prog4.progress((i) / len(doc_list), text=f"[{i+1}/{len(doc_list)}] {fname} — Engine 4")
-        stat4.info(f"🔄 Memproses: **{fname}**")
-        run_engine_jsonl(fname)
-    prog4.progress(1.0, text="✅ Engine 4 selesai untuk semua dokumen!")
-    stat4.success(f"✅ {len(doc_list)} dokumen diproses (JSONL).")
+    doc_list = list(st.session_state.docs.keys())
+    if doc_list:
+        st.markdown("### ⏳ Memproses Engine 4 (JSONL)")
+        prog4 = st.progress(0, text="Memulai Engine 4...")
+        stat4 = st.empty()
+        for i, fname in enumerate(doc_list):
+            prog4.progress(i / len(doc_list), text=f"[{i+1}/{len(doc_list)}] {fname} — Engine 4")
+            stat4.info(f"🔄 Memproses: **{fname}**")
+            run_engine_jsonl(fname)
+        prog4.progress(1.0, text="✅ Engine 4 selesai untuk semua dokumen!")
+        stat4.success(f"✅ {len(doc_list)} dokumen diproses (JSONL).")
 
 
 # ─────────────────────────────────────────────
@@ -477,7 +480,7 @@ with col_dl2:
 # ─────────────────────────────────────────────
 st.markdown("---")
 st.markdown(
-    "<center><small>🤖 Training Dataset Generator · Powered by Claude AI (Anthropic) · "
+    "<center><small>🤖 Training Dataset Generator · Pemrosesan Lokal (tanpa API) · "
     "Upload hingga 200 PDF · Output: CSV + JSONL per dokumen</small></center>",
     unsafe_allow_html=True,
 )

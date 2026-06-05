@@ -236,10 +236,10 @@ tab_process, tab_merge, tab_sessions = st.tabs(
 # ══════════════════════════════════════════════════════════════════════════════
 
 with tab_process:
-    result          = st.session_state.processed_result
+    _cur_result     = st.session_state.processed_result
     uploaded_count  = len(st.session_state.uploaded_files)
-    records_count   = result["total_chunks"] if result else 0
-    processed_count = result["stats"]["processed_files"] if result else 0
+    records_count   = _cur_result["total_chunks"] if _cur_result else 0
+    processed_count = _cur_result["stats"]["processed_files"] if _cur_result else 0
 
     # Metrics
     c1, c2, c3, c4 = st.columns(4)
@@ -247,7 +247,7 @@ with tab_process:
         (c1, uploaded_count, "Files Uploaded"),
         (c2, processed_count, "Docs Processed"),
         (c3, records_count, "SNI Records"),
-        (c4, result["stats"]["failed_files"] if result else 0, "Failed"),
+        (c4, _cur_result["stats"]["failed_files"] if _cur_result else 0, "Failed"),
     ]:
         with col:
             st.markdown(f'<div class="metric-card"><div class="metric-value">{val}</div>'
@@ -386,19 +386,28 @@ with tab_process:
         st.rerun()
 
     # ── Results ─────────────────────────────────────────────────────────────
-    if result and result.get("data"):
+    # Gunakan session_state langsung agar selalu fresh setelah rerun
+    _res = st.session_state.processed_result
+    if _res is not None:
         st.markdown('<div class="gradient-divider"></div>', unsafe_allow_html=True)
         st.markdown('<div class="section-header">📊 Hasil Ekstraksi SNI</div>', unsafe_allow_html=True)
 
-        records = result["data"]
+        records = _res.get("data", [])
+
+        # Selalu tampilkan download meski records kosong
 
         # Download buttons (JSON + JSONL)
         dc1, dc2, dc3 = st.columns([2, 1, 1])
         with dc1:
-            st.markdown(f'<div class="info-box">✅ <strong>{len(records)}</strong> dokumen SNI berhasil diekstrak.</div>',
-                        unsafe_allow_html=True)
+            ok  = _res.get("stats", {}).get("processed_files", len(records))
+            fail = _res.get("stats", {}).get("failed_files", 0)
+            st.markdown(
+                f'<div class="info-box">'
+                f'✅ <strong>{ok}</strong> berhasil · '
+                f'❌ <strong>{fail}</strong> gagal</div>',
+                unsafe_allow_html=True)
         with dc2:
-            json_bytes = json.dumps(result, ensure_ascii=False, indent=2).encode("utf-8")
+            json_bytes = json.dumps(_res, ensure_ascii=False, indent=2).encode("utf-8")
             st.download_button("⬇️ Download JSON", data=json_bytes,
                                file_name=f"sni_{st.session_state.session_id[:12]}.json",
                                mime="application/json", use_container_width=True,

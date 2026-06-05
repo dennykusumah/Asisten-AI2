@@ -1,17 +1,18 @@
 # engine.py
 """
 SNI Extractor Engine
-Memproses PDF standar SNI menjadi structured JSON dengan field:
+Memproses PDF/DOCX/TXT/Excel standar SNI menjadi structured JSON dengan field:
   sni_number, title, keywords, toc, summary, embedding_text
 """
 
 import os
+import io
 import json
 import uuid
 import shutil
 import time
 import re
-import random
+import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,10 +25,15 @@ from typing import Optional
 UPLOADS_DIR = Path("uploads")
 UPLOADS_DIR.mkdir(exist_ok=True)
 
-ALLOWED_EXTENSIONS = {".pdf", ".doc", ".docx", ".txt", ".md", ".jpg", ".jpeg", ".png", ".webp", ".gif"}
-IMAGE_EXTENSIONS   = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
-MAX_FILE_SIZE_MB   = 200
-MAX_FILES          = 200
+ALLOWED_EXTENSIONS = {
+    ".pdf", ".doc", ".docx", ".txt", ".md",
+    ".jpg", ".jpeg", ".png", ".webp", ".gif",
+    ".xlsx", ".xls", ".ods", ".csv",
+}
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+EXCEL_EXTENSIONS = {".xlsx", ".xls", ".ods", ".csv"}
+MAX_FILE_SIZE_MB  = 200
+MAX_FILES         = 200
 
 # ──────────────────────────────────────────────────────────────────────────────
 # UTILITY
@@ -155,61 +161,158 @@ def save_uploaded_file(session_id: str, uploaded_file) -> dict:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# TEXT EXTRACTION
+# TEXT EXTRACTION  — multi-layer with detailed error propagation
 # ──────────────────────────────────────────────────────────────────────────────
 
 def extract_text_from_file(file_path: str, file_ext: str) -> str:
+    """
+    Extract text from any supported file type.
+    Returns non-empty string on success, raises RuntimeError on total failure.
+    """
     p   = Path(file_path)
     ext = file_ext.lower()
 
     if ext in (".txt", ".md"):
-        for enc in ("utf-8", "latin-1", "cp1252"):
-            try: return p.read_text(enc)
-            except UnicodeDecodeError: continue
-        return p.read_bytes().decode("utf-8", errors="replace")
+        return _read_text_file(p)
 
     elif ext == ".pdf":
-        try:
-            import pypdf
-            reader = pypdf.PdfReader(str(p))
-            pages  = [page.extract_text() for page in reader.pages if page.extract_text()]
-            text   = "\n\n".join(pages)
-            if len(text.strip()) >= 50:
-                return text
-        except ImportError:
-            pass
-        return _extract_pdf_fallback(p)
+        return _extract_pdf(p)
 
     elif ext == ".docx":
-        try:
-            import docx as python_docx
-            doc   = python_docx.Document(str(p))
-            parts = [para.text for para in doc.paragraphs if para.text.strip()]
-            return "\n\n".join(parts)
-        except ImportError:
-            return _extract_docx_fallback(p)
+        return _extract_docx(p)
 
     elif ext == ".doc":
         return _extract_doc_legacy(p)
 
+    elif ext in EXCEL_EXTENSIONS:
+        return _extract_excel(p, ext)
+
     elif ext in IMAGE_EXTENSIONS:
-        return _extract_image_text(p)
+        return _extract_image_ocr(p)
 
-    return ""
+    raise RuntimeError(f"Tipe file tidak didukung: {ext}")
 
 
-def _extract_pdf_fallback(p: Path) -> str:
+# ── Plain text ────────────────────────────────────────────────────────────────
+
+def _read_text_file(p: Path) -> str:
+    for enc in ("utf-8", "latin-1", "cp1252"):
+        try:
+            text = p.read_text(enc)
+            if text.strip():
+                return text
+        except UnicodeDecodeError:
+            continue
+    return p.read_bytes().decode("utf-8", errors="replace")
+
+
+# ── PDF — 4-layer extraction ──────────────────────────────────────────────────
+
+def _extract_pdf(p: Path) -> str:
+    errors = []
+
+    # Layer 1: pypdf (fast, works on digital PDFs)
     try:
-        import subprocess
-        r = subprocess.run(["pdftotext", str(p), "-"], capture_output=True, text=True, timeout=120)
-        if r.returncode == 0 and r.stdout.strip():
-            return r.stdout
+        import pypdf
+        reader = pypdf.PdfReader(str(p))
+        pages  = []
+        for page in reader.pages:
+            t = page.extract_text()
+            if t and t.strip():
+                pages.append(t.strip())
+        text = "\n\n".join(pages)
+        if len(text.strip()) >= 100:
+            return text
+        errors.append("pypdf: teks < 100 karakter")
+    except Exception as e:
+        errors.append(f"pypdf: {e}")
+
+    # Layer 2: pdfminer.six (better layout handling)
+    try:
+        from pdfminer.high_level import extract_text as pdfminer_extract
+        text = pdfminer_extract(str(p))
+        if text and len(text.strip()) >= 100:
+            return text.strip()
+        errors.append("pdfminer: teks < 100 karakter")
+    except ImportError:
+        errors.append("pdfminer: tidak terinstall")
+    except Exception as e:
+        errors.append(f"pdfminer: {e}")
+
+    # Layer 3: pdftotext CLI
+    try:
+        r = subprocess.run(
+            ["pdftotext", "-layout", str(p), "-"],
+            capture_output=True, text=True, timeout=120
+        )
+        if r.returncode == 0 and r.stdout and len(r.stdout.strip()) >= 100:
+            return r.stdout.strip()
+        errors.append(f"pdftotext: returncode={r.returncode} atau teks kosong")
+    except FileNotFoundError:
+        errors.append("pdftotext: binary tidak ditemukan")
+    except Exception as e:
+        errors.append(f"pdftotext: {e}")
+
+    # Layer 4: OCR via pdf2image + pytesseract (for scanned PDFs)
+    try:
+        return _extract_pdf_ocr(p)
+    except Exception as e:
+        errors.append(f"OCR: {e}")
+
+    raise RuntimeError(
+        f"Semua metode ekstraksi PDF gagal untuk '{p.name}':\n" +
+        "\n".join(f"  • {e}" for e in errors)
+    )
+
+
+def _extract_pdf_ocr(p: Path) -> str:
+    """OCR fallback for scanned PDFs using pdf2image + pytesseract."""
+    from pdf2image import convert_from_path
+    import pytesseract
+
+    images = convert_from_path(str(p), dpi=200, first_page=1, last_page=10)
+    if not images:
+        raise RuntimeError("pdf2image: tidak ada halaman yang dikonversi")
+
+    pages = []
+    for img in images:
+        # Try Indonesian + English, fallback to English only
+        try:
+            t = pytesseract.image_to_string(img, lang="ind+eng")
+        except Exception:
+            t = pytesseract.image_to_string(img)
+        if t.strip():
+            pages.append(t.strip())
+
+    text = "\n\n".join(pages)
+    if len(text.strip()) < 50:
+        raise RuntimeError("OCR menghasilkan teks yang sangat pendek")
+    return text
+
+
+# ── DOCX ──────────────────────────────────────────────────────────────────────
+
+def _extract_docx(p: Path) -> str:
+    # Primary: python-docx
+    try:
+        import docx as python_docx
+        doc   = python_docx.Document(str(p))
+        parts = [para.text.strip() for para in doc.paragraphs if para.text.strip()]
+        # Also extract tables
+        for table in doc.tables:
+            for row in table.rows:
+                row_text = " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
+                if row_text:
+                    parts.append(row_text)
+        text = "\n\n".join(parts)
+        if text.strip():
+            return text
+    except ImportError:
+        pass
     except Exception:
         pass
-    return f"[Cannot extract PDF: {p.name}]"
 
-
-def _extract_docx_fallback(p: Path) -> str:
+    # Fallback: raw XML parsing
     try:
         import zipfile, xml.etree.ElementTree as ET
         texts = []
@@ -218,43 +321,96 @@ def _extract_docx_fallback(p: Path) -> str:
                 tree = ET.parse(f)
                 ns   = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
                 for t in tree.findall(".//w:t", ns):
-                    if t.text: texts.append(t.text)
-        return " ".join(texts)
+                    if t.text:
+                        texts.append(t.text)
+        text = " ".join(texts)
+        if text.strip():
+            return text
     except Exception:
-        return f"[Cannot extract DOCX: {p.name}]"
+        pass
 
+    raise RuntimeError(f"Tidak dapat mengekstrak teks dari DOCX: {p.name}")
+
+
+# ── Legacy DOC ────────────────────────────────────────────────────────────────
 
 def _extract_doc_legacy(p: Path) -> str:
     try:
-        import subprocess
         r = subprocess.run(["antiword", str(p)], capture_output=True, text=True, timeout=60)
         if r.returncode == 0 and r.stdout.strip():
             return r.stdout
     except Exception:
         pass
+    # Fallback: extract printable ASCII
     try:
         raw   = p.read_bytes()
         texts = re.findall(rb"[\x20-\x7e]{4,}", raw)
-        return " ".join(t.decode("ascii", errors="replace") for t in texts)
+        text  = " ".join(t.decode("ascii", errors="replace") for t in texts)
+        if text.strip():
+            return text
     except Exception:
-        return f"[Cannot extract DOC: {p.name}]"
+        pass
+    raise RuntimeError(f"Tidak dapat mengekstrak teks dari DOC: {p.name}")
 
 
-def _extract_image_text(p: Path) -> str:
+# ── Excel / CSV ───────────────────────────────────────────────────────────────
+
+def _extract_excel(p: Path, ext: str) -> str:
+    """Extract text from Excel/CSV files."""
+    import pandas as pd
+
+    try:
+        if ext == ".csv":
+            df = pd.read_csv(str(p), dtype=str, nrows=500)
+        elif ext == ".xls":
+            df = pd.read_excel(str(p), dtype=str, engine="xlrd", nrows=500)
+        elif ext == ".ods":
+            df = pd.read_excel(str(p), dtype=str, engine="odf", nrows=500)
+        else:  # .xlsx
+            df = pd.read_excel(str(p), dtype=str, engine="openpyxl", nrows=500)
+
+        # Convert to plain text representation
+        lines = []
+        lines.append(f"[File: {p.name}]")
+        lines.append(f"Kolom: {', '.join(str(c) for c in df.columns)}")
+        lines.append("")
+        for _, row in df.iterrows():
+            row_text = " | ".join(str(v) for v in row.values if str(v) not in ("nan", "None", ""))
+            if row_text.strip():
+                lines.append(row_text)
+        text = "\n".join(lines)
+        if text.strip():
+            return text
+    except Exception as e:
+        raise RuntimeError(f"Gagal membaca file Excel '{p.name}': {e}")
+
+    raise RuntimeError(f"File Excel kosong atau tidak terbaca: {p.name}")
+
+
+# ── Image OCR ─────────────────────────────────────────────────────────────────
+
+def _extract_image_ocr(p: Path) -> str:
     try:
         import pytesseract
         from PIL import Image
         img = Image.open(str(p))
         if img.mode not in ("RGB", "L"):
             img = img.convert("RGB")
-        try:   return pytesseract.image_to_string(img, lang="ind+eng").strip()
-        except: return pytesseract.image_to_string(img).strip()
+        try:
+            text = pytesseract.image_to_string(img, lang="ind+eng")
+        except Exception:
+            text = pytesseract.image_to_string(img)
+        if text.strip():
+            return text.strip()
+        raise RuntimeError("OCR menghasilkan teks kosong")
+    except ImportError as e:
+        raise RuntimeError(f"pytesseract/Pillow tidak terinstall: {e}")
     except Exception as e:
-        return f"[Image OCR failed: {p.name} — {e}]"
+        raise RuntimeError(f"OCR gagal untuk '{p.name}': {e}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# SNI FIELD NORMALISER  (Python-side fallback / post-processing)
+# SNI FIELD NORMALISER
 # ──────────────────────────────────────────────────────────────────────────────
 
 _SNI_ID_RE = re.compile(
@@ -263,15 +419,10 @@ _SNI_ID_RE = re.compile(
 )
 
 def _normalise_sni_fields(raw: dict, source_text: str) -> dict:
-    """
-    Fallback normaliser: fix / fill missing fields after Claude extraction.
-    """
-    # sni_number — scan raw text for SNI id pattern
+    # sni_number
     if not raw.get("sni_number"):
         m = _SNI_ID_RE.search(source_text)
         raw["sni_number"] = m.group(0).strip() if m else ""
-
-    # Normalise: uppercase, remove extra spaces
     raw["sni_number"] = re.sub(r"\s+", " ", raw.get("sni_number", "").strip()).upper()
 
     # title
@@ -298,12 +449,12 @@ def _normalise_sni_fields(raw: dict, source_text: str) -> dict:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# CLAUDE EXTRACTION — 1 API call per document
+# CLAUDE EXTRACTION
 # ──────────────────────────────────────────────────────────────────────────────
 
 _EXTRACT_SYSTEM = """\
 Kamu adalah asisten ekstraksi dokumen standar SNI (Standar Nasional Indonesia).
-Tugasmu: baca teks PDF SNI dan kembalikan JSON VALID SAJA — tidak ada teks lain di luar JSON.
+Tugasmu: baca teks dokumen SNI dan kembalikan JSON VALID SAJA — tidak ada teks lain di luar JSON.
 
 Format JSON yang harus dikembalikan:
 {
@@ -321,40 +472,40 @@ Aturan:
 - toc: daftar isi / nama bab utama (tanpa nomor halaman)
 - summary: ringkasan singkat ruang lingkup dan persyaratan utama
 - Kembalikan HANYA JSON, tidak ada penjelasan, tidak ada markdown.
+- Jika dokumen bukan SNI, tetap ekstrak field semampu mungkin dari konten yang ada.
 """
 
 def _extract_sni_fields_via_claude(text: str) -> dict:
-    """Call Claude to extract structured SNI fields from raw PDF text."""
+    """Call Claude to extract structured SNI fields from raw document text."""
     try:
         import anthropic as _anthropic
     except ImportError:
-        raise RuntimeError("Package anthropic tidak ditemukan. Tambahkan anthropic ke requirements.txt.")
-    client = _anthropic.Anthropic()
+        raise RuntimeError("Package 'anthropic' tidak ditemukan. Tambahkan ke requirements.txt")
 
-    # Truncate to ~80k chars to stay within context
+    client   = _anthropic.Anthropic()
     truncated = text[:80_000] if len(text) > 80_000 else text
 
     msg = client.messages.create(
         model="claude-opus-4-5",
         max_tokens=2048,
         system=_EXTRACT_SYSTEM,
-        messages=[{"role": "user", "content": f"Teks SNI:\n\n{truncated}"}],
+        messages=[{"role": "user", "content": f"Teks dokumen:\n\n{truncated}"}],
     )
 
     raw_text = msg.content[0].text.strip()
-
-    # Strip markdown fences if present
+    # Strip markdown fences
     raw_text = re.sub(r"^```(?:json)?\s*", "", raw_text)
     raw_text = re.sub(r"\s*```$", "", raw_text)
 
     try:
         return json.loads(raw_text)
     except json.JSONDecodeError:
-        # Best-effort: extract JSON object from response
         m = re.search(r"\{.*\}", raw_text, re.DOTALL)
         if m:
-            try: return json.loads(m.group(0))
-            except: pass
+            try:
+                return json.loads(m.group(0))
+            except Exception:
+                pass
         return {}
 
 
@@ -379,15 +530,18 @@ def build_embedding_text(sni_number: str, title: str, keywords: list,
 
 def _process_single_sni_file(args) -> dict:
     info, _settings = args
+    fname = info["original_name"]
     try:
         raw_text = extract_text_from_file(info["path"], info["ext"])
-        if not raw_text.strip():
-            return {"status": "empty", "file": info["original_name"], "record": None}
+
+        if not raw_text or not raw_text.strip():
+            return {"status": "error", "file": fname,
+                    "error": "Tidak ada teks yang bisa diekstrak dari file ini", "record": None}
 
         # Claude extraction
         fields = _extract_sni_fields_via_claude(raw_text)
 
-        # Python-side normalisation / fallback
+        # Normalise
         fields = _normalise_sni_fields(fields, raw_text)
 
         sni_number = fields["sni_number"]
@@ -405,13 +559,13 @@ def _process_single_sni_file(args) -> dict:
             "toc":            toc,
             "summary":        summary,
             "embedding_text": embedding_text,
-            "source_file":    info["original_name"],
+            "source_file":    fname,
             "processed_at":   datetime.now(timezone.utc).isoformat(),
         }
-        return {"status": "success", "file": info["original_name"], "record": record}
+        return {"status": "success", "file": fname, "record": record}
 
     except Exception as e:
-        return {"status": "error", "file": info["original_name"], "error": str(e), "record": None}
+        return {"status": "error", "file": fname, "error": str(e), "record": None}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -421,13 +575,9 @@ def _process_single_sni_file(args) -> dict:
 def process_documents(
     file_infos: list,
     settings: dict,
-    max_workers: int = 4,          # lower: each call hits Claude API
+    max_workers: int = 8,
     progress_callback=None,
 ) -> dict:
-    """
-    Process a list of SNI PDF files → list of structured SNI records.
-    Returns result dict compatible with app.py expectations.
-    """
     total     = len(file_infos)
     results   = [None] * total
     completed = [0]
@@ -438,16 +588,16 @@ def process_documents(
             for i, info in enumerate(file_infos)
         }
         for future in as_completed(future_to_idx):
-            idx              = future_to_idx[future]
-            results[idx]     = future.result()
-            completed[0]    += 1
+            idx           = future_to_idx[future]
+            results[idx]  = future.result()
+            completed[0] += 1
             if progress_callback:
                 progress_callback("extract", completed[0], total, file_infos[idx]["original_name"])
 
-    records        = []
-    file_results   = []
-    processed_ok   = 0
-    failed         = 0
+    records      = []
+    file_results = []
+    processed_ok = 0
+    failed       = 0
 
     for res in results:
         if res is None:
@@ -463,12 +613,16 @@ def process_documents(
         "total_files":     total,
         "processed_files": processed_ok,
         "failed_files":    failed,
-        "total_chunks":    processed_ok,   # 1 record = 1 "chunk" in UI terms
+        "total_chunks":    processed_ok,
         "total_chars":     sum(len(r.get("embedding_text", "")) for r in records),
+        "errors":          [
+            {"file": r["file"], "error": r.get("error", "")}
+            for r in file_results if r["status"] != "success"
+        ],
     }
 
     return {
-        "version":      "2.0",
+        "version":      "3.0",
         "type":         "sni_extraction",
         "created_at":   datetime.now(timezone.utc).isoformat(),
         "settings":     settings,
@@ -479,11 +633,6 @@ def process_documents(
         "data":         records,
     }
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# process_and_paraphrase — kept for app.py compatibility
-# For SNI mode paraphrase is skipped; just returns process result
-# ──────────────────────────────────────────────────────────────────────────────
 
 def process_and_paraphrase(
     file_infos: list,
@@ -507,7 +656,6 @@ def save_processed_data(session_id: str, data: dict, settings: dict) -> dict:
     output_path   = processed_dir / "output.json"
     output_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
 
-    # Also write as JSONL (1 record per line)
     jsonl_path = processed_dir / "output.jsonl"
     with jsonl_path.open("w", encoding="utf-8") as f:
         for record in data.get("data", []):
@@ -547,12 +695,11 @@ def merge_json_files(file_contents: list, strategy: str = "auto") -> dict:
             all_items.extend(items)
             stats["item_counts"].append({"file": f["name"], "items": len(items)})
         merged = {
-            "version": "2.0", "type": "sni_extraction", "merged": True,
+            "version": "3.0", "type": "sni_extraction", "merged": True,
             "merged_at": datetime.now(timezone.utc).isoformat(),
             "source_files": [f["name"] for f in file_contents],
             "total": len(all_items), "total_chunks": len(all_items), "data": all_items,
         }
-
     elif merge_mode == "array":
         all_items = []
         for f in file_contents:
@@ -561,7 +708,6 @@ def merge_json_files(file_contents: list, strategy: str = "auto") -> dict:
             all_items.extend(arr)
             stats["item_counts"].append({"file": f["name"], "items": len(arr)})
         merged = all_items
-
     else:
         merged = {"_merged": True, "_merged_at": datetime.now(timezone.utc).isoformat(),
                   "_source_files": [f["name"] for f in file_contents]}

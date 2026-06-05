@@ -6,6 +6,7 @@ Mengubah PDF standar SNI menjadi structured JSON dengan embedding_text.
 
 import io
 import json
+import os
 import re
 import time
 import zipfile
@@ -184,7 +185,30 @@ def init_state():
 init_state()
 
 # ──────────────────────────────────────────────────────────────────────────────
-# SIDEBAR
+# API KEY CHECK  — tampilkan peringatan jelas jika key tidak ada
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _check_api_key() -> bool:
+    try:
+        key = st.secrets.get("ANTHROPIC_API_KEY", "")
+        if key and key.strip():
+            return True
+    except Exception:
+        pass
+    key = os.environ.get("ANTHROPIC_API_KEY", "")
+    return bool(key and key.strip())
+
+_api_key_ok = _check_api_key()
+if not _api_key_ok:
+    st.error(
+        "**❌ ANTHROPIC_API_KEY tidak ditemukan!**\n\n"
+        "Tambahkan API key Anthropic agar ekstraksi SNI bisa berjalan:\n\n"
+        "**Streamlit Cloud:** Buka *App Settings → Secrets*, tambahkan:\n"
+        "```\nANTHROPIC_API_KEY = \"sk-ant-...\"\n```\n"
+        "**Lokal:** Buat file `.streamlit/secrets.toml` dengan isi yang sama, "
+        "atau set environment variable `ANTHROPIC_API_KEY`."
+    )
+
 # ──────────────────────────────────────────────────────────────────────────────
 
 with st.sidebar:

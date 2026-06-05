@@ -12,7 +12,6 @@ import shutil
 import time
 import re
 import random
-import anthropic
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
@@ -326,7 +325,11 @@ Aturan:
 
 def _extract_sni_fields_via_claude(text: str) -> dict:
     """Call Claude to extract structured SNI fields from raw PDF text."""
-    client = anthropic.Anthropic()
+    try:
+        import anthropic as _anthropic
+    except ImportError:
+        raise RuntimeError("Package anthropic tidak ditemukan. Tambahkan anthropic ke requirements.txt.")
+    client = _anthropic.Anthropic()
 
     # Truncate to ~80k chars to stay within context
     truncated = text[:80_000] if len(text) > 80_000 else text

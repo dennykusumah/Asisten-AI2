@@ -1,366 +1,342 @@
 """
-engine.py — 4 engine pemrosesan PDF tanpa API key, tanpa sumy indonesian
-Menggunakan: PyMuPDF, pytesseract, NLTK (english tokenizer), regex
+engine.py — Keyword extraction engine (no AI/API)
+Methods: TF-IDF, RAKE, and frequency-based analysis
 """
 
 import re
-import io
-import json
-import collections
+import math
+from collections import Counter, defaultdict
+from typing import List, Dict, Tuple
 
-import fitz          # PyMuPDF
-import pytesseract
-from PIL import Image
 
-import nltk
-from nltk.tokenize import sent_tokenize
+# ─── Stopwords (Indonesian + English) ──────────────────────────────────────────
 
-for pkg in [("tokenizers/punkt_tab/english", "punkt_tab"),
-            ("corpora/stopwords",             "stopwords")]:
-    try:
-        nltk.data.find(pkg[0])
-    except LookupError:
-        nltk.download(pkg[1], quiet=True)
-
-try:
-    from nltk.corpus import stopwords as _sw
-    _EN = set(_sw.words("english"))
-except Exception:
-    _EN = set()
-
-# Stopwords Indonesia — hardcoded, tidak perlu corpus download
-_ID = {
-    "yang","dan","di","ke","dari","dengan","untuk","pada","adalah","ini",
-    "itu","atau","juga","dalam","tidak","akan","telah","oleh","sebagai",
-    "dapat","serta","lebih","maka","tersebut","sesuai","harus","bahwa",
-    "tentang","secara","antara","yaitu","namun","apabila","setiap","agar",
-    "seperti","jika","bagi","dilakukan","dilaksanakan","berdasarkan",
-    "menggunakan","terhadap","maupun","perlu","ada","sudah","belum",
-    "sangat","hal","cara","dimana","sedangkan","adapun","selain","sehingga",
-    "kemudian","berikut","meliputi","terdiri","melakukan","setelah","sebelum",
-    "antara","sampai","sejak","hingga","melalui","selama","termasuk",
-    "sebuah","suatu","semua","beberapa","setiap","tiap","banyak","sedikit",
-    "lain","lainnya","tersebut","demikian","bahkan","namun","tetapi","namun",
-    "meski","walaupun","karena","sehingga","agar","supaya","ketika","saat",
+STOPWORDS_EN = {
+    "a","about","above","after","again","against","all","am","an","and","any",
+    "are","aren't","as","at","be","because","been","before","being","below",
+    "between","both","but","by","can","can't","cannot","could","couldn't","did",
+    "didn't","do","does","doesn't","doing","don't","down","during","each","few",
+    "for","from","further","get","got","had","hadn't","has","hasn't","have",
+    "haven't","having","he","he'd","he'll","he's","her","here","here's","hers",
+    "herself","him","himself","his","how","how's","i","i'd","i'll","i'm","i've",
+    "if","in","into","is","isn't","it","it's","its","itself","let's","me","more",
+    "most","mustn't","my","myself","no","nor","not","of","off","on","once",
+    "only","or","other","ought","our","ours","ourselves","out","over","own",
+    "same","shan't","she","she'd","she'll","she's","should","shouldn't","so",
+    "some","such","than","that","that's","the","their","theirs","them",
+    "themselves","then","there","there's","these","they","they'd","they'll",
+    "they're","they've","this","those","through","to","too","under","until",
+    "up","very","was","wasn't","we","we'd","we'll","we're","we've","were",
+    "weren't","what","what's","when","when's","where","where's","which","while",
+    "who","who's","whom","why","why's","will","with","won't","would","wouldn't",
+    "you","you'd","you'll","you're","you've","your","yours","yourself","yourselves",
+    "also","may","much","many","well","one","two","three","four","five","six",
+    "seven","eight","nine","ten","however","therefore","thus","hence","since",
+    "use","used","using","used","based","given","provide","provides","provided",
+    "include","includes","including","within","without","whether","via","per",
+    "etc","i.e","e.g","new","old","large","small","high","low","good","bad",
+    "first","second","last","next","like","just","even","still","already",
+    "always","never","often","sometimes","usually","generally","specifically",
+    "particularly","especially","rather","quite","very","really","simply",
+    "certain","various","different","several","another","every","each","both",
+    "either","neither","nor","yet","though","although","despite","whereas",
+    "while","meanwhile","otherwise","moreover","furthermore","additionally",
+    "consequently","subsequently","finally","initially","previously","currently",
+    "recently","according","related","regarding","among","upon","along",
+    "across","around","throughout","toward","towards","away","back","forward",
+    "together","apart","instead","rather","enough","here","there","where",
+    "when","how","why","which","who","whom","whose","what","that","this",
+    "these","those","make","made","making","take","takes","taking","taken",
+    "come","comes","coming","came","go","goes","going","went","gone","see",
+    "sees","seeing","saw","seen","know","knows","knowing","knew","known",
+    "think","thinks","thinking","thought","want","wants","wanting","wanted",
+    "look","looks","looking","looked","need","needs","needing","needed",
+    "show","shows","showing","showed","shown","find","finds","finding","found",
+    "give","gives","giving","gave","given","tell","tells","telling","told",
+    "seem","seems","seeming","seemed","say","says","saying","said","put",
+    "puts","putting","call","calls","calling","called","ask","asks","asking",
+    "asked","turn","turns","turning","turned","keep","keeps","keeping","kept",
+    "help","helps","helping","helped","set","sets","setting","run","runs",
+    "running","ran","hold","holds","holding","held","move","moves","moving",
+    "moved","work","works","working","worked","play","plays","playing","played",
+    "let","lets","letting","begin","begins","beginning","began","begun",
+    "seem","try","tries","trying","tried","leave","leaves","leaving","left",
+    "might","could","should","would","shall","will","may","can","must",
+    "number","numbers","way","ways","time","times","day","days","year","years",
+    "part","parts","place","places","case","cases","point","points","fact",
+    "facts","example","examples","type","types","kind","kinds","form","forms",
+    "level","levels","line","lines","group","groups","area","areas","end","ends",
+    "hand","hands","side","sides","head","heads","page","pages","name","names",
+    "home","homes","house","houses","world","words","word","right","rights",
+    "long","short","little","own","same","different","few","many","most","much",
+    "other","others","another","such","any","some","no","all","both","each",
+    "more","less","just","only","even","still","now","than","then","so","as",
+    "if","or","and","but","because","by","at","on","in","of","to","for",
+    "with","is","was","are","were","be","been","being","have","has","had",
+    "do","does","did","will","would","could","should","may","might","must",
+    "shall","can","need","dare","ought","used","do","did","does",
 }
-STOPWORDS = _ID | _EN
+
+STOPWORDS_ID = {
+    "yang","dan","di","ini","itu","dengan","untuk","dari","dalam","pada",
+    "ke","adalah","ada","akan","juga","tidak","atau","oleh","sudah","telah",
+    "dapat","bisa","lebih","serta","sebagai","harus","saat","sangat","agar",
+    "namun","tapi","tetapi","karena","ketika","setelah","sebelum","sedang",
+    "semua","berbagai","bagi","tersebut","antara","tentang","bahwa","seperti",
+    "secara","antara","selain","setiap","melalui","masih","terhadap","lain",
+    "hal","cara","tahun","saya","kami","kita","mereka","dia","ia","nya",
+    "nya","anda","kamu","mereka","kami","kita","beliau","aku","mu","ku",
+    "pun","pula","lagi","mana","bukan","jika","apabila","sehingga","maka",
+    "hingga","hanya","begitu","sudah","telah","sedang","sedangkan","kemudian",
+    "selama","selanjutnya","yaitu","yakni","antara","baik","besar","kecil",
+    "lain","lainnya","sama","saling","sesama","setiap","masing","diri",
+    "sendiri","beberapa","banyak","sedikit","cukup","sangat","amat","terlalu",
+    "sebuah","suatu","sebuah","sebuah","suatu","tersebut","dimana","ketika",
+    "meski","walaupun","meskipun","kendati","biarpun","padahal","justru",
+    "bahkan","apalagi","terlebih","terutama","khususnya","umumnya","biasanya",
+    "akhirnya","pertama","kedua","ketiga","selain","sehingga","oleh","karena",
+    "sebab","akibat","dampak","pengaruh","peran","fungsi","tujuan","manfaat",
+    "hasil","proses","langkah","tahapan","metode","sistem","bentuk","jenis",
+    "macam","contoh","misalnya","seperti","antara","lain","yaitu","yakni",
+    "terkait","berkaitan","berhubungan","mengenai","perihal","soal","masalah",
+    "ada","adanya","adakah","terdapat","berupa","merupakan","adalah","ialah",
+    "yakni","yaitu","artinya","maksudnya","dalam","pada","di","ke","dari",
+    "dan","atau","tetapi","namun","juga","pun","bahkan","malah","justru",
+    "per","via","bagi","oleh","untuk","atas","bawah","depan","belakang",
+    "kiri","kanan","atas","bawah","sini","sana","situ","mana","mana",
+    "nya","ku","mu","kah","lah","pun","tah","deh","dong","nih","sih","lho",
+    "loh","oh","ah","eh","ih","uh","hem","hm","wah","nah","ya","iya","yuk",
+}
+
+STOPWORDS = STOPWORDS_EN | STOPWORDS_ID
 
 
-# ─────────────────────────────────────────────
-# Utilitas PDF
-# ─────────────────────────────────────────────
+# ─── Text Utilities ─────────────────────────────────────────────────────────────
 
-def extract_text_from_pdf(pdf_bytes: bytes) -> str:
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    pages = []
-    for page in doc:
-        text = page.get_text("text").strip()
-        if text:
-            pages.append(text)
-        else:
-            try:
-                pix = page.get_pixmap(dpi=200)
-                img = Image.open(io.BytesIO(pix.tobytes("png")))
-                ocr = pytesseract.image_to_string(img, lang="ind+eng")
-                if ocr.strip():
-                    pages.append(ocr.strip())
-            except Exception:
-                pass
-    doc.close()
-    return "\n\n".join(pages)
+def clean_text(text: str) -> str:
+    """Normalize text: lowercase, remove special chars, collapse whitespace."""
+    text = text.lower()
+    text = re.sub(r'[^\w\s\-]', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
 
 
-def _word_freq(text: str) -> collections.Counter:
-    words = re.findall(r'\b[a-zA-Z\u00C0-\u024F]{3,}\b', text.lower())
-    return collections.Counter(w for w in words if w not in STOPWORDS)
+def tokenize(text: str) -> List[str]:
+    """Tokenize and filter: min 3 chars, not stopword, not purely numeric."""
+    tokens = re.findall(r'\b[a-zA-Z][a-zA-Z\-]{2,}\b', text.lower())
+    return [t for t in tokens if t not in STOPWORDS and not t.isdigit()]
 
 
-def _score_sentences(sents: list, freq: collections.Counter) -> list:
-    """Kembalikan list (score, sent) diurutkan desc."""
-    scored = []
-    for s in sents:
-        ws = re.findall(r'\b[a-zA-Z\u00C0-\u024F]{3,}\b', s.lower())
-        score = sum(freq.get(w, 0) for w in ws if w not in STOPWORDS)
-        # Normalisasi panjang
-        score = score / max(len(ws), 1)
-        scored.append((score, s))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return scored
+def split_sentences(text: str) -> List[str]:
+    """Split text into sentences."""
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    return [s.strip() for s in sentences if len(s.strip()) > 20]
 
 
-# ─────────────────────────────────────────────
-# ENGINE 1 — Daftar Isi
-# ─────────────────────────────────────────────
+def split_into_chunks(text: str, chunk_size: int = 500) -> List[str]:
+    """Split text into word-level chunks (for TF-IDF 'document' simulation)."""
+    words = text.split()
+    chunks = []
+    for i in range(0, len(words), chunk_size):
+        chunk = ' '.join(words[i:i + chunk_size])
+        if chunk.strip():
+            chunks.append(chunk)
+    return chunks if chunks else [text]
 
-def engine1_daftar_isi(pdf_bytes: bytes) -> str:
-    text = extract_text_from_pdf(pdf_bytes)
-    lines = text.splitlines()
 
-    dots_re    = re.compile(r'\.{3,}')
-    pageno_re  = re.compile(r'\s+\d{1,4}\s*$')
-    toc_hdr    = re.compile(r'daftar\s+isi|table\s+of\s+contents', re.I)
-    heading_re = re.compile(
-        r'^(\d+[\.\d]*\s|BAB\s+[IVXLC0-9]+|Pasal\s+\d+|[A-Z]{2,}\s)',
-        re.I
+# ─── Method 1: TF-IDF ──────────────────────────────────────────────────────────
+
+def compute_tfidf(text: str, top_n: int = 30) -> List[Tuple[str, float]]:
+    """
+    Simulate TF-IDF by treating the document as a set of chunks.
+    Keywords with high term frequency but low document frequency rank highest.
+    """
+    chunks = split_into_chunks(text, chunk_size=300)
+    num_chunks = len(chunks)
+
+    # Term frequency per chunk
+    chunk_tokens = [tokenize(clean_text(c)) for c in chunks]
+    df = Counter()  # document frequency
+    for tokens in chunk_tokens:
+        for t in set(tokens):
+            df[t] += 1
+
+    # Aggregate TF across whole document
+    all_tokens = tokenize(clean_text(text))
+    tf = Counter(all_tokens)
+    total = sum(tf.values()) or 1
+
+    scores = {}
+    for term, count in tf.items():
+        tf_val = count / total
+        idf_val = math.log((num_chunks + 1) / (df.get(term, 0) + 1)) + 1
+        scores[term] = round(tf_val * idf_val, 6)
+
+    return sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_n]
+
+
+# ─── Method 2: RAKE (Rapid Automatic Keyword Extraction) ───────────────────────
+
+def compute_rake(text: str, top_n: int = 30) -> List[Tuple[str, float]]:
+    """
+    RAKE: extract candidate phrases (split by stopwords/punctuation),
+    score each word by degree/frequency, score phrase as sum of word scores.
+    """
+    # Build candidate phrases
+    phrase_pattern = re.compile(
+        r'(?:[^' + re.escape(''.join(['.', ',', ';', ':', '!', '?', '(', ')', '\n', '\t', '"', "'"])) + r']+)'
     )
+    clean = clean_text(text)
+    # Split on stopwords and punctuation
+    stop_pat = r'\b(' + '|'.join(re.escape(w) for w in sorted(STOPWORDS, key=len, reverse=True)) + r')\b'
+    segments = re.split(stop_pat + r'|[,;:\.\!\?\(\)\"\'\n]', clean)
 
-    items = []
-    in_toc = False
-    consecutive_non_toc = 0
+    candidates = []
+    for seg in segments:
+        seg = seg.strip() if seg else ''
+        words = [w for w in seg.split() if len(w) >= 3 and re.match(r'^[a-zA-Z\-]+$', w)]
+        if 1 <= len(words) <= 5:
+            candidates.append(words)
 
-    for line in lines:
-        s = line.strip()
-        if not s:
-            continue
+    # Word score = degree / frequency
+    word_freq: Dict[str, int] = defaultdict(int)
+    word_degree: Dict[str, int] = defaultdict(int)
+    for phrase in candidates:
+        for w in phrase:
+            word_freq[w] += 1
+            word_degree[w] += len(phrase) - 1
 
-        if toc_hdr.search(s):
-            in_toc = True
-            consecutive_non_toc = 0
-            continue
+    word_score = {w: (word_degree[w] + word_freq[w]) / word_freq[w]
+                  for w in word_freq}
 
-        has_dots = dots_re.search(s)
-        looks_heading = heading_re.match(s) and len(s) < 160
+    # Phrase scores
+    phrase_scores: Dict[str, float] = {}
+    for phrase in candidates:
+        phrase_str = ' '.join(phrase)
+        score = sum(word_score.get(w, 0) for w in phrase)
+        if phrase_str not in phrase_scores or score > phrase_scores[phrase_str]:
+            phrase_scores[phrase_str] = round(score, 4)
 
-        if in_toc:
-            if has_dots or looks_heading:
-                consecutive_non_toc = 0
-                cleaned = dots_re.sub('', s)
-                cleaned = pageno_re.sub('', cleaned).strip()
-                if 3 < len(cleaned) < 160:
-                    items.append(cleaned)
-            else:
-                consecutive_non_toc += 1
-                # Keluar jika 3 baris berturut bukan TOC
-                if consecutive_non_toc >= 3:
-                    in_toc = False
-        elif has_dots:
-            cleaned = dots_re.sub('', s)
-            cleaned = pageno_re.sub('', cleaned).strip()
-            if 3 < len(cleaned) < 160:
-                items.append(cleaned)
-
-    # Fallback: ambil baris heading pendek
-    if len(items) < 3:
-        items = []
-        for line in lines:
-            s = line.strip()
-            if heading_re.match(s) and 5 < len(s) < 140:
-                cleaned = dots_re.sub('', s)
-                cleaned = pageno_re.sub('', cleaned).strip()
-                if cleaned:
-                    items.append(cleaned)
-
-    # Deduplikasi
-    seen, unique = set(), []
-    for it in items:
-        k = re.sub(r'\s+', ' ', it.lower())
-        if k not in seen:
-            seen.add(k)
-            unique.append(it)
-
-    return "; ".join(unique) if unique else "TIDAK ADA DAFTAR ISI"
+    return sorted(phrase_scores.items(), key=lambda x: x[1], reverse=True)[:top_n]
 
 
-# ─────────────────────────────────────────────
-# ENGINE 2 — Keywords
-# ─────────────────────────────────────────────
+# ─── Method 3: Frequency + Bigrams ─────────────────────────────────────────────
 
-def engine2_keywords(pdf_bytes: bytes) -> str:
-    text = extract_text_from_pdf(pdf_bytes)
-    freq = _word_freq(text)
+def compute_frequency(text: str, top_n: int = 30) -> List[Tuple[str, float]]:
+    """
+    Combine unigram frequency + bigram frequency to capture multi-word keywords.
+    Score normalized to [0, 1].
+    """
+    tokens = tokenize(clean_text(text))
+    unigram = Counter(tokens)
 
-    # Bigram
-    tokens = [w for w in re.findall(r'\b[a-zA-Z\u00C0-\u024F]{3,}\b', text.lower())
-              if w not in STOPWORDS]
-    bigram_freq = collections.Counter(
-        f"{tokens[i]} {tokens[i+1]}" for i in range(len(tokens)-1)
-    )
+    bigrams = [f"{tokens[i]} {tokens[i+1]}" for i in range(len(tokens) - 1)
+               if tokens[i] not in STOPWORDS and tokens[i+1] not in STOPWORDS]
+    bigram_c = Counter(bigrams)
 
-    kws = []
-    seen_words = set()
+    # Merge: bigrams weighted x2
+    combined: Dict[str, float] = {}
+    for w, c in unigram.items():
+        combined[w] = float(c)
+    for bg, c in bigram_c.items():
+        if c >= 2:  # only meaningful bigrams
+            combined[bg] = float(c) * 1.8
 
-    for phrase, cnt in bigram_freq.most_common(12):
-        if cnt < 2:
-            break
-        kws.append(phrase.title())
-        for w in phrase.split():
-            seen_words.add(w)
+    max_score = max(combined.values(), default=1)
+    normalized = {k: round(v / max_score, 4) for k, v in combined.items()}
 
-    for word, _ in freq.most_common(25):
-        if word not in seen_words and len(kws) < 20:
-            kws.append(word.title())
-
-    return ", ".join(kws) if kws else "Tidak ada kata kunci"
+    return sorted(normalized.items(), key=lambda x: x[1], reverse=True)[:top_n]
 
 
-# ─────────────────────────────────────────────
-# ENGINE 3 — Ringkasan  (pure Python, no sumy)
-# ─────────────────────────────────────────────
+# ─── Combined Ensemble ─────────────────────────────────────────────────────────
 
-def engine3_ringkasan(pdf_bytes: bytes) -> str:
-    text = extract_text_from_pdf(pdf_bytes)
-    if not text.strip():
-        return "Dokumen tidak dapat dibaca atau kosong."
+def extract_keywords(
+    text: str,
+    method: str = "ensemble",
+    top_n: int = 30,
+    min_score: float = 0.0,
+) -> List[Dict]:
+    """
+    Main extraction function.
 
-    # Filter paragraf berbahasa Indonesia
-    id_marker = re.compile(
-        r'\b(adalah|merupakan|dalam|untuk|dengan|bahwa|tersebut|'
-        r'dilakukan|berdasarkan|sesuai|pasal|bab|ketentuan|standar|'
-        r'persyaratan|pengujian|prosedur|metode|dilaksanakan)\b', re.I
-    )
-    paras = [p.strip() for p in re.split(r'\n{2,}', text) if p.strip()]
-    id_paras = [p for p in paras if id_marker.search(p)]
-    use_text = "\n\n".join(id_paras) if len(id_paras) >= 3 else text
-    use_text = use_text[:14000]
+    Parameters
+    ----------
+    text    : raw PDF text
+    method  : 'tfidf' | 'rake' | 'frequency' | 'ensemble'
+    top_n   : number of keywords to return
+    min_score: minimum normalized score threshold
 
-    # Tokenisasi kalimat pakai english tokenizer (cukup untuk kalimat-kalimat Indonesia)
-    try:
-        sents = sent_tokenize(use_text)
-    except Exception:
-        sents = re.split(r'(?<=[.!?])\s+', use_text)
+    Returns
+    -------
+    List of dicts with keys: keyword, score, method
+    """
+    if not text or len(text.strip()) < 50:
+        return []
 
-    if not sents:
-        return use_text[:600]
+    results: List[Tuple[str, float]] = []
 
-    freq = _word_freq(use_text)
-    scored = _score_sentences(sents, freq)
+    if method in ("tfidf", "ensemble"):
+        results += [(kw, sc, "TF-IDF") for kw, sc in compute_tfidf(text, top_n)]
 
-    # Ambil 8 kalimat terbaik, kembalikan dalam urutan asli
-    top = set(s for _, s in scored[:8])
-    ordered = [s for s in sents if s in top]
+    if method in ("rake", "ensemble"):
+        results += [(kw, sc, "RAKE") for kw, sc in compute_rake(text, top_n)]
 
-    result = " ".join(ordered)
-    return result.strip() if result.strip() else use_text[:600]
+    if method in ("frequency", "ensemble"):
+        results += [(kw, sc, "Frequency") for kw, sc in compute_frequency(text, top_n)]
 
+    if method == "ensemble":
+        # Normalize each method's scores to [0,1] and average across methods
+        from collections import defaultdict
+        kw_scores: Dict[str, List[float]] = defaultdict(list)
+        kw_method: Dict[str, List[str]] = defaultdict(list)
 
-# ─────────────────────────────────────────────
-# ENGINE 4 — JSONL
-# ─────────────────────────────────────────────
+        # Group by method and normalize within each
+        method_groups: Dict[str, List[Tuple[str, float]]] = defaultdict(list)
+        for kw, sc, m in results:
+            method_groups[m].append((kw, sc))
 
-def _doc_type(text: str, fname: str) -> str:
-    fl = fname.lower(); tl = text[:3000].lower()
-    if re.search(r'\bsni\b', fl) or 'standar nasional indonesia' in tl:
-        return "Standar Nasional Indonesia (SNI)"
-    if re.search(r'\biso\b', fl):
-        return "Standar Internasional ISO"
-    if re.search(r'peraturan\s+(menteri|pemerintah|presiden)', tl):
-        return "Peraturan/Regulasi Pemerintah"
-    if re.search(r'(panduan|pedoman|manual)', tl):
-        return "Panduan / Manual"
-    if re.search(r'(laporan|report)', tl):
-        return "Laporan"
-    return "Dokumen Teknis"
+        for m, pairs in method_groups.items():
+            max_sc = max(s for _, s in pairs) if pairs else 1
+            for kw, sc in pairs:
+                norm = sc / max_sc if max_sc else 0
+                kw_scores[kw].append(norm)
+                kw_method[kw].append(m)
 
+        combined = [
+            {
+                "keyword": kw,
+                "score": round(sum(scores) / len(scores), 4),
+                "method": " + ".join(sorted(set(kw_method[kw]))),
+            }
+            for kw, scores in kw_scores.items()
+        ]
+        combined = [r for r in combined if r["score"] >= min_score]
+        combined.sort(key=lambda x: x["score"], reverse=True)
+        return combined[:top_n]
 
-def _paraphrase(s: str) -> str:
-    """Variasi kalimat sederhana."""
-    s = s.strip()
-    subs = [
-        (r'\badalah\b',       'merupakan'),
-        (r'\bmerupakan\b',    'didefinisikan sebagai'),
-        (r'\bdilakukan\b',    'dikerjakan'),
-        (r'\bdigunakan\b',    'dimanfaatkan'),
-        (r'\bberdasarkan\b',  'mengacu pada'),
-        (r'\bharus\b',        'wajib'),
-        (r'\bperlu\b',        'diperlukan'),
-        (r'\bmencakup\b',     'meliputi'),
-        (r'\bditetapkan\b',   'ditentukan'),
-    ]
-    for pat, rep in subs:
-        s = re.sub(pat, rep, s, count=1, flags=re.I)
-    return s
+    # Single method
+    seen = set()
+    final = []
+    for kw, sc, m in results:
+        if kw not in seen and sc >= min_score:
+            seen.add(kw)
+            final.append({"keyword": kw, "score": round(sc, 4), "method": m})
+
+    final.sort(key=lambda x: x["score"], reverse=True)
+    return final[:top_n]
 
 
-def engine4_jsonl(pdf_bytes: bytes, filename: str = "document.pdf") -> str:
-    text = extract_text_from_pdf(pdf_bytes)
-    if not text.strip():
-        return json.dumps({"prompt": f"Apa isi dari {filename}?",
-                           "completion": "Dokumen tidak dapat dibaca."}, ensure_ascii=False)
+# ─── Document Stats ─────────────────────────────────────────────────────────────
 
-    base     = re.sub(r'\.pdf$', '', filename, flags=re.I)
-    doc_type = _doc_type(text, filename)
-    freq     = _word_freq(text)
-
-    # Kalimat kunci
-    try:
-        sents = sent_tokenize(text[:12000])
-    except Exception:
-        sents = re.split(r'(?<=[.!?])\s+', text[:12000])
-
-    scored = _score_sentences(sents, freq)
-    key_sents = [s for _, s in scored[:25] if len(s) > 40]
-
-    kw_str  = engine2_keywords(pdf_bytes)
-    kw_list = [k.strip() for k in kw_str.split(',')[:8]]
-
-    paras = [p.strip() for p in re.split(r'\n{2,}', text) if len(p.strip()) > 80]
-    intro = paras[0][:400]  if paras     else text[:400]
-    outro = paras[-1][:300] if len(paras)>1 else ""
-
-    lines = []
-
-    # Pair 1: jenis dokumen
-    lines.append(json.dumps({
-        "prompt": f"Apa jenis dokumen {base}?",
-        "completion": f"Dokumen {base} merupakan {doc_type}."
-    }, ensure_ascii=False))
-
-    # Pair 2: topik utama
-    if kw_list:
-        lines.append(json.dumps({
-            "prompt": f"Apa topik utama yang dibahas dalam {base}?",
-            "completion": f"Topik utama dalam {base} meliputi: {', '.join(kw_list[:5])}."
-        }, ensure_ascii=False))
-
-    # Pair 3: deskripsi awal
-    if intro:
-        lines.append(json.dumps({
-            "prompt": f"Jelaskan secara singkat isi dari dokumen {base}.",
-            "completion": _paraphrase(intro)
-        }, ensure_ascii=False))
-
-    # Pair 4–13: dari kalimat kunci
-    templates = [
-        "Apa yang dimaksud dengan {kw} dalam {doc}?",
-        "Bagaimana {doc} menjelaskan tentang {kw}?",
-        "Sebutkan ketentuan terkait {kw} dalam {doc}.",
-        "Apa persyaratan {kw} berdasarkan {doc}?",
-        "Bagaimana prosedur {kw} menurut {doc}?",
-        "Apa tujuan dari {kw} yang disebutkan dalam {doc}?",
-        "Jelaskan fungsi {kw} sesuai {doc}.",
-        "Apa yang diatur tentang {kw} di dalam {doc}?",
-        "Bagaimana standar {kw} dijelaskan dalam {doc}?",
-        "Sebutkan informasi penting tentang {kw} dalam {doc}.",
-    ]
-    used = set()
-    for i, sent in enumerate(key_sents):
-        if len(lines) >= 13:
-            break
-        if sent in used:
-            continue
-        used.add(sent)
-        kw = next((k for k in kw_list if k.lower() in sent.lower()), None)
-        if not kw and kw_list:
-            kw = kw_list[i % len(kw_list)]
-        tmpl = templates[i % len(templates)]
-        lines.append(json.dumps({
-            "prompt": tmpl.format(kw=kw or "hal ini", doc=base),
-            "completion": _paraphrase(sent)
-        }, ensure_ascii=False))
-
-    # Pair: ringkasan
-    ring = engine3_ringkasan(pdf_bytes)
-    if ring and len(ring) > 50:
-        lines.append(json.dumps({
-            "prompt": f"Berikan ringkasan dokumen {base}.",
-            "completion": ring[:600]
-        }, ensure_ascii=False))
-
-    # Pair: kesimpulan
-    if outro:
-        lines.append(json.dumps({
-            "prompt": f"Apa kesimpulan atau ketentuan akhir dalam {base}?",
-            "completion": _paraphrase(outro)
-        }, ensure_ascii=False))
-
-    return "\n".join(lines)
+def document_stats(text: str) -> Dict:
+    """Return basic document statistics."""
+    words = text.split()
+    sentences = split_sentences(text)
+    tokens = tokenize(clean_text(text))
+    return {
+        "total_chars": len(text),
+        "total_words": len(words),
+        "total_sentences": len(sentences),
+        "unique_tokens": len(set(tokens)),
+        "avg_sentence_length": round(len(words) / max(len(sentences), 1), 1),
+    }

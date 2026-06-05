@@ -491,7 +491,7 @@ def process_and_paraphrase(
     language: str = "auto",
     progress_callback=None,
 ) -> dict:
-    result = process_documents(file_infos, settings, max_workers=4,
+    result = process_documents(file_infos, settings, max_workers=8,
                                progress_callback=progress_callback)
     result["paraphrased"] = False
     return result

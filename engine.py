@@ -475,6 +475,26 @@ Aturan:
 - Jika dokumen bukan SNI, tetap ekstrak field semampu mungkin dari konten yang ada.
 """
 
+def _get_anthropic_api_key() -> str:
+    # 1. Streamlit secrets
+    try:
+        import streamlit as _st
+        key = _st.secrets.get("ANTHROPIC_API_KEY", "")
+        if key and key.strip():
+            return key.strip()
+    except Exception:
+        pass
+    # 2. Environment variable
+    key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if key and key.strip():
+        return key.strip()
+    raise RuntimeError(
+        "ANTHROPIC_API_KEY tidak ditemukan.\n"
+        "Tambahkan di Streamlit Cloud > App Settings > Secrets:\n"
+        "  ANTHROPIC_API_KEY = \"sk-ant-...\""
+    )
+
+
 def _extract_sni_fields_via_claude(text: str) -> dict:
     """Call Claude to extract structured SNI fields from raw document text."""
     try:
@@ -482,7 +502,8 @@ def _extract_sni_fields_via_claude(text: str) -> dict:
     except ImportError:
         raise RuntimeError("Package 'anthropic' tidak ditemukan. Tambahkan ke requirements.txt")
 
-    client   = _anthropic.Anthropic()
+    api_key   = _get_anthropic_api_key()
+    client    = _anthropic.Anthropic(api_key=api_key)
     truncated = text[:80_000] if len(text) > 80_000 else text
 
     msg = client.messages.create(

@@ -4,8 +4,11 @@ SNI Extractor — Streamlit App
 Mengubah PDF standar SNI menjadi structured JSON dengan embedding_text.
 """
 
+import io
 import json
+import re
 import time
+import zipfile
 from pathlib import Path
 
 import streamlit as st
@@ -311,7 +314,7 @@ with tab_process:
               <div style="font-size:3rem;margin-bottom:1rem;">📂</div>
               <div style="font-weight:600;color:#ffffff !important;">Belum ada file</div>
             </div>""", unsafe_allow_html=True)
-        elif result:
+        elif _cur_result:
             _queue_area.markdown("""<div style="text-align:center;padding:3rem 1rem;">
               <div style="font-size:3rem;margin-bottom:1rem;">✅</div>
               <div style="font-weight:600;color:#6ee7b7 !important;">Selesai</div>
@@ -396,7 +399,7 @@ with tab_process:
 
         # Selalu tampilkan download meski records kosong
 
-        # Download buttons (JSON + JSONL)
+        # Download buttons (JSON + JSONL ZIP)
         dc1, dc2, dc3 = st.columns([2, 1, 1])
         with dc1:
             ok  = _res.get("stats", {}).get("processed_files", len(records))
@@ -413,11 +416,25 @@ with tab_process:
                                mime="application/json", use_container_width=True,
                                type="primary", key="dl_json")
         with dc3:
-            jsonl_lines = "\n".join(json.dumps(r, ensure_ascii=False) for r in records)
-            st.download_button("⬇️ Download JSONL", data=jsonl_lines.encode("utf-8"),
-                               file_name=f"sni_{st.session_state.session_id[:12]}.jsonl",
-                               mime="application/x-ndjson", use_container_width=True,
-                               key="dl_jsonl")
+            # Build ZIP containing one .jsonl per processed record
+            zip_buf = io.BytesIO()
+            with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for rec in records:
+                    src = rec.get("source_file", "unknown")
+                    safe = re.sub(r"[^a-zA-Z0-9._\-]", "_", Path(src).stem)
+                    fname = f"{safe}.jsonl"
+                    zf.writestr(fname, json.dumps(rec, ensure_ascii=False) + "\n")
+                # Also include a combined JSONL
+                combined = "\n".join(json.dumps(r, ensure_ascii=False) for r in records)
+                zf.writestr("_all_combined.jsonl", combined)
+            zip_buf.seek(0)
+            st.download_button(
+                f"⬇️ Download {len(records)} JSONL (ZIP)",
+                data=zip_buf.getvalue(),
+                file_name=f"sni_{st.session_state.session_id[:12]}_jsonl.zip",
+                mime="application/zip", use_container_width=True,
+                key="dl_jsonl"
+            )
 
         st.markdown("<br>", unsafe_allow_html=True)
 

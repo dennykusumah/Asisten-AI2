@@ -88,6 +88,8 @@ section[data-testid="stSidebar"] label { color:#e2e8f0 !important; -webkit-text-
              border:2px solid #f87171 !important; }
 .badge-docx,.badge-doc { background:#1e3a5f !important; color:#eff6ff !important;
                          -webkit-text-fill-color:#eff6ff !important; border:2px solid #60a5fa !important; }
+.badge-xlsx,.badge-xls,.badge-ods,.badge-csv { background:#14532d !important; color:#dcfce7 !important;
+                         -webkit-text-fill-color:#dcfce7 !important; border:2px solid #4ade80 !important; }
 .badge-txt,.badge-md { background:#374151 !important; color:#f9fafb !important;
                        -webkit-text-fill-color:#f9fafb !important; border:2px solid #9ca3af !important; }
 
@@ -211,7 +213,10 @@ with st.sidebar:
     st.markdown("""<div class="info-box">
       Setiap dokumen SNI menghasilkan:<br>
       <strong>sni_number</strong> · <strong>title</strong> · <strong>keywords</strong><br>
-      <strong>toc</strong> · <strong>summary</strong> · <strong>embedding_text</strong>
+      <strong>toc</strong> · <strong>summary</strong> · <strong>embedding_text</strong><br><br>
+      <strong>Format:</strong> PDF · DOCX · TXT · MD<br>
+      XLSX · XLS · ODS · CSV · JPG · PNG<br>
+      <em>PDF scan → OCR otomatis</em>
     </div>""", unsafe_allow_html=True)
 
     st.markdown("---")
@@ -263,13 +268,14 @@ with tab_process:
 
     with col_upload:
         st.markdown('<div class="section-header">📤 Upload Dokumen SNI</div>', unsafe_allow_html=True)
-        st.markdown("""<div class="info-box">Format didukung: <strong>PDF, DOCX, TXT</strong>
-          · Claude akan mengekstrak field SNI secara otomatis.</div>""", unsafe_allow_html=True)
+        st.markdown("""<div class="info-box">Format didukung: <strong>PDF, DOCX, TXT, XLSX, XLS, ODS, CSV, Gambar (JPG/PNG)</strong>
+          · Claude akan mengekstrak field SNI secara otomatis. PDF scan akan di-OCR otomatis.</div>""", unsafe_allow_html=True)
         st.markdown("<br>", unsafe_allow_html=True)
 
         new_files = st.file_uploader(
             "Upload file",
-            type=["pdf", "docx", "doc", "txt", "md"],
+            type=["pdf", "docx", "doc", "txt", "md", "xlsx", "xls", "ods", "csv",
+                  "jpg", "jpeg", "png", "webp"],
             accept_multiple_files=True,
             key=f"main_uploader_{st.session_state.uploader_key}",
         )
@@ -409,6 +415,19 @@ with tab_process:
                 f'✅ <strong>{ok}</strong> berhasil · '
                 f'❌ <strong>{fail}</strong> gagal</div>',
                 unsafe_allow_html=True)
+
+        # Show error details if any failures
+        errors = _res.get("stats", {}).get("errors", [])
+        if errors:
+            with st.expander(f"⚠️ Detail {len(errors)} file gagal", expanded=True):
+                for err in errors:
+                    st.markdown(
+                        f'<div style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.4);'
+                        f'border-radius:8px;padding:0.6rem 0.9rem;margin-bottom:0.5rem;">'
+                        f'<span style="color:#f87171;font-weight:700;">❌ {err["file"]}</span><br>'
+                        f'<span style="color:#fca5a5;font-size:0.85rem;">{err["error"]}</span></div>',
+                        unsafe_allow_html=True
+                    )
         with dc2:
             json_bytes = json.dumps(_res, ensure_ascii=False, indent=2).encode("utf-8")
             st.download_button("⬇️ Download JSON", data=json_bytes,

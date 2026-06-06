@@ -1331,7 +1331,7 @@ def merge_json_files(file_contents: list, strategy: str = "auto") -> dict:
             "total_chunks": len(all_items),
             "data": all_items,
         }
-
+      
     elif merge_mode == "array":
         all_items = []
         for f in file_contents:

@@ -410,7 +410,7 @@ with st.sidebar:
 
     chunk_method = st.selectbox("Chunking Method", options=["tokens", "sentences", "paragraphs"],
         format_func=lambda x: {"tokens": "📦 Tokens", "sentences": "📝 Sentences", "paragraphs": "📄 Paragraphs"}[x], key="sb_chunk_method")
-    chunk_size = st.number_input("Chunk Size", min_value=64, max_value=4096, value=64, step=64, key="ni_chunk_size")
+    chunk_size = st.number_input("Chunk Size", min_value=64, max_value=4096, value=512, step=64, key="ni_chunk_size")
     overlap = st.number_input("Overlap", min_value=0, max_value=500, value=50, step=10, key="ni_overlap")
     output_format = st.selectbox("Output Format", options=["training", "qa", "messages"],
         format_func=lambda x: {"training": "🎯 Training", "qa": "❓ Q&A", "messages": "💬 Messages"}[x], key="sb_output_format")
